@@ -33,10 +33,27 @@ unchanged. The hook never blocks a commit.
 
 ## Install
 
+macOS and Linux:
+
 ```sh
-cargo install --path .
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/jamiesanson/jev-conventional-commits/releases/latest/download/jev-cc-installer.sh | sh
+```
+
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/jamiesanson/jev-conventional-commits/releases/latest/download/jev-cc-installer.ps1 | iex"
+```
+
+Prebuilt archives for each platform are also on the
+[releases page](https://github.com/jamiesanson/jev-conventional-commits/releases). To build from
+source, run `cargo install --path .`.
+
+Then, in each repository:
+
+```sh
 export TYPESAFE_API_KEY=...   # from TypeSafe
-cd your-repo && jev-cc install
+jev-cc install
 ```
 
 `install` adds two hooks to the repository:
@@ -92,6 +109,22 @@ cargo test
 cargo build --release
 ./target/release/jev-cc install   # dogfood: classify this repo's own commits
 ```
+
+Hooks installed from a binary on `PATH` call `jev-cc` by name, so upgrades keep working.
+Hooks installed from a local build, as above, call it by absolute path.
+
+### Releasing
+
+Releases are built by [dist](https://opensource.axo.dev/cargo-dist/) in
+`.github/workflows/release.yml`. Bump `version` in `Cargo.toml`, then push a matching tag:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+This builds macOS, Linux (glibc and static musl) and Windows binaries, generates the
+installers, and publishes a GitHub Release. After changing `dist-workspace.toml`, run
+`dist generate` to regenerate the workflow.
 
 ## Status
 
