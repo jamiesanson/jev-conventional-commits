@@ -68,6 +68,7 @@ fix(config): handle empty config files
 |---|---|---|
 | `TYPESAFE_API_KEY` | | |
 | `JEV_CC_TIMEOUT_MS` | `1000` | |
+| `JEV_CC_DEADLINE_MS` | `2000` | Time limit for the whole hook |
 | `JEV_CC_MIN_CONFIDENCE` | `0.6` | Minimum confidence to apply a type |
 | `JEV_CC_BREAKING_THRESHOLD` | `0.85` | Probability needed to add `!` |
 | `JEV_CC_BASE_URL` | `https://api.typesafe.ai` | |

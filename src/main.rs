@@ -22,6 +22,7 @@ ENVIRONMENT:
     TYPESAFE_API_KEY             API key for Jev (required for anything local rules can't decide)
     JEV_CC_BASE_URL              API base URL (default: https://api.typesafe.ai)
     JEV_CC_TIMEOUT_MS            Request timeout; the message is left as-is on timeout (default: 1000)
+    JEV_CC_DEADLINE_MS           Time limit for the whole hook (default: 2000)
     JEV_CC_MIN_CONFIDENCE        Minimum confidence to apply a type (default: 0.6)
     JEV_CC_BREAKING_THRESHOLD    Probability needed to mark a change breaking (default: 0.85)
     JEV_CC_DISABLE               Set to 1 to skip the hook entirely
@@ -40,9 +41,13 @@ fn main() -> ExitCode {
 
     match args.as_slice() {
         ["prepare-commit-msg", file, rest @ ..] => {
+            start_deadline(Path::new(file));
             hook_result(prepare_commit_msg(Path::new(file), rest.first().copied()))
         }
-        ["commit-msg", file] => hook_result(commit_msg(Path::new(file))),
+        ["commit-msg", file] => {
+            start_deadline(Path::new(file));
+            hook_result(commit_msg(Path::new(file)))
+        }
         ["classify", message @ ..] => match run_classify(&message.join(" ")) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -74,6 +79,23 @@ fn hook_result(result: Result<(), String>) -> ExitCode {
         eprintln!("jev-cc: message left unchanged ({e})");
     }
     ExitCode::SUCCESS
+}
+
+/// Ends the hook after `JEV_CC_DEADLINE_MS`, whatever it's waiting on (git, DNS, the API),
+/// so jev-cc can never hang a commit. Message writes are atomic, so exiting at any point
+/// leaves either the original message or the prefixed one.
+fn start_deadline(message_file: &Path) {
+    let deadline = Duration::from_millis(env_f64("JEV_CC_DEADLINE_MS", 2000.0) as u64);
+    let tmp = tmp_path(message_file);
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline);
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!(
+            "jev-cc: message left unchanged (took longer than {}ms)",
+            deadline.as_millis()
+        );
+        std::process::exit(0);
+    });
 }
 
 fn prepare_commit_msg(file: &Path, source: Option<&str>) -> Result<(), String> {
@@ -126,15 +148,19 @@ fn commit_msg(file: &Path) -> Result<(), String> {
 /// Writes via a temporary file and a rename, so an interrupted write can't leave git a
 /// truncated commit message.
 fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".jev-cc.tmp");
-    let tmp = PathBuf::from(tmp);
+    let tmp = tmp_path(path);
     std::fs::write(&tmp, contents)
         .and_then(|()| std::fs::rename(&tmp, path))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             e.to_string()
         })
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".jev-cc.tmp");
+    PathBuf::from(tmp)
 }
 
 fn run_classify(message: &str) -> Result<(), String> {
