@@ -179,20 +179,29 @@ fn install() -> Result<(), String> {
     Ok(())
 }
 
-/// Hooks call `jev-cc` from PATH when that's the binary running `install`, so package
-/// manager upgrades (which move versioned install directories) keep working. Otherwise,
-/// such as for a local `target/release` build, they call the absolute path.
-/// Either way, a missing binary must not block commits.
+/// Hooks try each candidate in turn and exit 0 if none exist, so a missing binary never
+/// blocks a commit.
+///
+/// The first candidate is an absolute path, so hooks work from git GUIs that don't
+/// inherit the shell's PATH. When the binary running `install` is the one on PATH, that
+/// PATH entry is used (e.g. `/opt/homebrew/bin/jev-cc`) rather than `current_exe()`,
+/// which can resolve into a versioned directory that disappears on upgrade. The bare
+/// name is the last resort for when that path moves.
 fn hook_script(hook: &str, exe: &Path) -> String {
-    let bin = match find_on_path(BIN_NAME) {
-        Some(found) if same_file(&found, exe) => BIN_NAME.to_string(),
-        _ => exe.display().to_string(),
+    let stable = match find_on_path(BIN_NAME) {
+        Some(found) if same_file(&found, exe) => found,
+        _ => exe.to_path_buf(),
     };
+    let candidates = format!("\"{}\" {BIN_NAME}", stable.display());
     format!(
         "#!/bin/sh\n\
          {HOOK_MARKER}\n\
-         command -v \"{bin}\" >/dev/null 2>&1 || exit 0\n\
-         exec \"{bin}\" {hook} \"$@\"\n"
+         for bin in {candidates}; do\n\
+         \x20   if command -v \"$bin\" >/dev/null 2>&1; then\n\
+         \x20       exec \"$bin\" {hook} \"$@\"\n\
+         \x20   fi\n\
+         done\n\
+         exit 0\n"
     )
 }
 
