@@ -1,0 +1,175 @@
+//! Collects the staged changes from git, trimmed so the request stays small and fast.
+
+use std::process::Command;
+
+/// Upper bound on patch text sent to Jev. Well under the ~64k token input limit;
+/// smaller inputs are also faster.
+const PATCH_BUDGET_BYTES: usize = 24_000;
+/// Per-file cap so one large file can't crowd out the rest of the change.
+const FILE_BUDGET_BYTES: usize = 4_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    /// Git status letter: A, M, D, R, C, T.
+    pub status: char,
+    pub path: String,
+}
+
+#[derive(Debug)]
+pub struct StagedDiff {
+    pub files: Vec<ChangedFile>,
+    pub patch: String,
+}
+
+pub fn staged() -> Result<StagedDiff, String> {
+    let name_status = git(&["diff", "--cached", "--name-status", "-M", "-z"])?;
+    let files = parse_name_status(&name_status);
+    let patch = git(&[
+        "diff",
+        "--cached",
+        "-M",
+        "--unified=1",
+        "--no-color",
+        "--no-ext-diff",
+    ])?;
+    Ok(StagedDiff {
+        files,
+        patch: trim_patch(&patch),
+    })
+}
+
+fn git(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Parses `git diff --name-status -z` output. Renames and copies carry two paths;
+/// the destination is kept.
+fn parse_name_status(raw: &str) -> Vec<ChangedFile> {
+    let mut fields = raw.split('\0').filter(|s| !s.is_empty());
+    let mut files = Vec::new();
+    while let Some(code) = fields.next() {
+        let status = code.chars().next().unwrap_or('M');
+        if matches!(status, 'R' | 'C') {
+            fields.next();
+        }
+        if let Some(path) = fields.next() {
+            files.push(ChangedFile {
+                status,
+                path: path.to_string(),
+            });
+        }
+    }
+    files
+}
+
+/// Drops noise (lockfiles, binaries) and caps each file and the total patch size.
+fn trim_patch(patch: &str) -> String {
+    let mut out = String::new();
+    for section in split_files(patch) {
+        if out.len() >= PATCH_BUDGET_BYTES {
+            out.push_str("\n[remaining files omitted]\n");
+            break;
+        }
+        let header = section.lines().next().unwrap_or_default();
+        if is_noise(header) || section.contains("\nBinary files ") {
+            out.push_str(header);
+            out.push_str("\n[contents omitted]\n");
+            continue;
+        }
+        let budget = FILE_BUDGET_BYTES.min(PATCH_BUDGET_BYTES - out.len());
+        if section.len() > budget {
+            out.push_str(&section[..floor_char_boundary(section, budget)]);
+            out.push_str("\n[truncated]\n");
+        } else {
+            out.push_str(section);
+        }
+    }
+    out
+}
+
+fn split_files(patch: &str) -> Vec<&str> {
+    // Only headers at the start of a line; patch content lines begin with +, - or space.
+    let mut starts: Vec<usize> = patch
+        .match_indices("diff --git ")
+        .map(|(i, _)| i)
+        .filter(|&i| i == 0 || patch.as_bytes()[i - 1] == b'\n')
+        .collect();
+    starts.push(patch.len());
+    starts.windows(2).map(|w| &patch[w[0]..w[1]]).collect()
+}
+
+fn is_noise(header: &str) -> bool {
+    const LOCKFILES: &[&str] = &[
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lockb",
+        "Gemfile.lock",
+        "poetry.lock",
+        "uv.lock",
+        "go.sum",
+        "composer.lock",
+    ];
+    LOCKFILES.iter().any(|f| header.ends_with(&format!("/{f}")))
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_name_status_with_renames() {
+        let raw = "M\0src/main.rs\0R100\0old.rs\0new.rs\0A\0README.md\0";
+        let files = parse_name_status(raw);
+        assert_eq!(
+            files,
+            vec![
+                ChangedFile {
+                    status: 'M',
+                    path: "src/main.rs".into()
+                },
+                ChangedFile {
+                    status: 'R',
+                    path: "new.rs".into()
+                },
+                ChangedFile {
+                    status: 'A',
+                    path: "README.md".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_lockfile_contents() {
+        let patch = "diff --git a/Cargo.lock b/Cargo.lock\n+lots\n+of\n+lines\n\
+                     diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n";
+        let trimmed = trim_patch(patch);
+        assert!(trimmed.contains("Cargo.lock\n[contents omitted]"));
+        assert!(!trimmed.contains("+lots"));
+        assert!(trimmed.contains("+fn x() {}"));
+    }
+
+    #[test]
+    fn truncates_large_files() {
+        let patch = format!("diff --git a/big b/big\n{}", "+x\n".repeat(10_000));
+        let trimmed = trim_patch(&patch);
+        assert!(trimmed.len() < FILE_BUDGET_BYTES + 100);
+        assert!(trimmed.ends_with("[truncated]\n"));
+    }
+}
