@@ -31,6 +31,68 @@ unchanged. The hook never blocks a commit.
 - **Out of the way.** Skips merges, squashes, amends, and messages that are already
   conventional.
 
+## Install
+
+```sh
+cargo install --path .
+export TYPESAFE_API_KEY=...   # from TypeSafe
+cd your-repo && jev-cc install
+```
+
+`install` adds two hooks to the repository:
+
+- `prepare-commit-msg` classifies the staged diff and adds the prefix. With `git commit -m`
+  the prefix goes in front of your message. With the editor, the first line is pre-filled
+  (e.g. `fix(config): `) for you to finish.
+- `commit-msg` clears a message that is only the pre-filled prefix, so quitting the editor
+  without writing anything still aborts the commit.
+
+If a hook already exists, `install` won't overwrite it. Add `jev-cc <hook> "$@"` to it
+yourself.
+
+Try it without committing:
+
+```console
+$ git add -p
+$ jev-cc classify "handle empty config files"
+fix(config): handle empty config files
+  source: Jev, confidence: 87%, took 180ms
+```
+
+## Configuration
+
+| Variable | Default | |
+|---|---|---|
+| `TYPESAFE_API_KEY` | | Required for anything the local rules can't decide |
+| `JEV_CC_TIMEOUT_MS` | `1000` | The message is left unchanged on timeout |
+| `JEV_CC_MIN_CONFIDENCE` | `0.6` | Below this, the message is left unchanged |
+| `JEV_CC_BREAKING_THRESHOLD` | `0.85` | Probability needed to add `!` |
+| `JEV_CC_BASE_URL` | `https://api.typesafe.ai` | |
+| `JEV_CC_DISABLE` | | Set to `1` to skip the hook |
+
+## Classification
+
+1. **Skip** merges, squashes, amends, `fixup!`/`squash!` commits, and messages that already
+   start with `type:` or `type(scope):`.
+2. **Local rules.** If every changed file is documentation, a test or CI config, the type is
+   `docs`, `test` or `ci`, and no request is made.
+3. **Jev.** Otherwise, one request asks two questions about the changed file list, a trimmed
+   patch (lockfiles and binaries omitted, about 24 KB at most) and your message:
+   - `type`: a choice between `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
+     `build`, `ci`, `chore` and `revert`
+   - `breaking`: yes or no
+4. **Scope** is the directory every changed file shares, skipping container directories
+   such as `src/` and `packages/`. For example, changes only in `src/config/` get `(config)`.
+   Changes at the root or across several directories get no scope.
+
+## Development
+
+```sh
+cargo test
+cargo build --release
+./target/release/jev-cc install   # dogfood: classify this repo's own commits
+```
+
 ## Status
 
-Early development. See the open branches for progress.
+Early development.
