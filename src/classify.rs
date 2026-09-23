@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::diff::{ChangedFile, StagedDiff};
+use crate::diff::{self, ChangedFile, Outgoing};
 use crate::jev::{self, Answer, NoulCriteria, Question};
 
 /// Conventional commit types and the criteria Jev uses to tell them apart.
@@ -69,13 +69,14 @@ pub struct Settings {
 
 pub fn classify(
     client: Option<&jev::Client>,
-    diff: &StagedDiff,
+    files: &[ChangedFile],
+    exclude: &[String],
     message: &str,
     settings: &Settings,
 ) -> Result<Classification, String> {
-    let scope = scope_for(&diff.files);
+    let scope = scope_for(files);
 
-    if let Some(kind) = local_type(&diff.files) {
+    if let Some(kind) = local_type(files) {
         return Ok(Classification {
             kind,
             scope,
@@ -86,8 +87,12 @@ pub fn classify(
     }
 
     let client = client.ok_or_else(|| jev::Error::MissingApiKey.to_string())?;
+    let outgoing = diff::outgoing(files, exclude)?;
+    if outgoing.files.is_empty() {
+        return Err("every changed file is excluded".into());
+    }
     let response = client
-        .system_one(&request(diff, message))
+        .system_one(&request(&outgoing, message))
         .map_err(|e| e.to_string())?;
 
     let (kind, confidence) = match response.answers.get("type") {
@@ -112,13 +117,13 @@ pub fn classify(
     })
 }
 
-fn request<'a>(diff: &StagedDiff, message: &str) -> jev::Request<'a> {
-    let files: Vec<String> = diff
+fn request<'a>(outgoing: &Outgoing, message: &str) -> jev::Request<'a> {
+    let files: Vec<String> = outgoing
         .files
         .iter()
         .map(|f| format!("{} {}", f.status, f.path))
         .collect();
-    let mut state = serde_json::json!({ "files": files, "patch": diff.patch });
+    let mut state = serde_json::json!({ "files": files, "patch": outgoing.patch });
     if !message.is_empty() {
         state["message"] = serde_json::Value::from(message);
     }

@@ -15,32 +15,69 @@ pub struct ChangedFile {
     pub path: String,
 }
 
+const NAME_STATUS: &[&str] = &["diff", "--cached", "--name-status", "-M", "-z"];
+const PATCH: &[&str] = &[
+    "diff",
+    "--cached",
+    "-M",
+    "--unified=1",
+    "--no-color",
+    "--no-ext-diff",
+];
+
+/// Every staged file. Only used locally.
+pub fn staged_files() -> Result<Vec<ChangedFile>, String> {
+    Ok(parse_name_status(&git(NAME_STATUS, &[])?))
+}
+
+/// What's sent to Jev: the staged files not matched by an `exclude` pattern, and their
+/// patch. Only built once the local rules can't decide, so they stay fast.
 #[derive(Debug)]
-pub struct StagedDiff {
+pub struct Outgoing {
     pub files: Vec<ChangedFile>,
     pub patch: String,
 }
 
-pub fn staged() -> Result<StagedDiff, String> {
-    let name_status = git(&["diff", "--cached", "--name-status", "-M", "-z"])?;
-    let files = parse_name_status(&name_status);
-    let patch = git(&[
-        "diff",
-        "--cached",
-        "-M",
-        "--unified=1",
-        "--no-color",
-        "--no-ext-diff",
-    ])?;
-    Ok(StagedDiff {
-        files,
-        patch: trim_patch(&patch),
+/// `exclude` holds git glob pathspecs relative to the repository root. Git applies them,
+/// so excluded files' paths and contents never reach the patch.
+pub fn outgoing(all: &[ChangedFile], exclude: &[String]) -> Result<Outgoing, String> {
+    let pathspecs = exclude_pathspecs(exclude);
+    if pathspecs.is_empty() {
+        return Ok(Outgoing {
+            files: all.to_vec(),
+            patch: trim_patch(&git(PATCH, &[])?),
+        });
+    }
+    // Both git runs are needed; run them side by side.
+    let (files, patch) = std::thread::scope(|s| {
+        let files = s.spawn(|| git(NAME_STATUS, &pathspecs));
+        let patch = git(PATCH, &pathspecs);
+        (files.join().expect("git thread panicked"), patch)
+    });
+    Ok(Outgoing {
+        files: parse_name_status(&files?),
+        patch: trim_patch(&patch?),
     })
 }
 
-fn git(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
+/// `:(top)` includes everything, then each pattern is excluded relative to the repository
+/// root, whatever the working directory.
+fn exclude_pathspecs(exclude: &[String]) -> Vec<String> {
+    if exclude.is_empty() {
+        return Vec::new();
+    }
+    std::iter::once(":(top)".to_string())
+        .chain(exclude.iter().map(|p| format!(":(top,glob,exclude){p}")))
+        .collect()
+}
+
+fn git(args: &[&str], pathspecs: &[String]) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.args(args);
+    if !pathspecs.is_empty() {
+        command.arg("--").args(pathspecs);
+    }
+    let output = command
         .output()
         .map_err(|e| format!("failed to run git: {e}"))?;
     if !output.status.success() {

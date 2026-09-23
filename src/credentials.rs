@@ -14,20 +14,7 @@ pub fn api_key() -> Option<String> {
     std::env::var(ENV_VAR)
         .ok()
         .filter(|k| !k.trim().is_empty())
-        .or_else(|| load(&dir()?))
-}
-
-/// `$XDG_CONFIG_HOME/jev-cc`, `~/.config/jev-cc`, or `%APPDATA%\jev-cc` on Windows.
-pub fn dir() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".config")))
-    };
-    Some(base?.join("jev-cc"))
+        .or_else(|| load(&crate::config::dir()?))
 }
 
 pub fn load(dir: &Path) -> Option<String> {

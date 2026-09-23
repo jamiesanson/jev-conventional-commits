@@ -64,15 +64,38 @@ fix(config): handle empty config files
 
 ## Configuration
 
-| Variable | Default | |
-|---|---|---|
-| `TYPESAFE_API_KEY` | | Overrides the key saved by `jev-cc login` |
-| `JEV_CC_TIMEOUT_MS` | `1000` | |
-| `JEV_CC_DEADLINE_MS` | `2000` | Time limit for the whole hook |
-| `JEV_CC_MIN_CONFIDENCE` | `0.6` | Minimum confidence to apply a type |
-| `JEV_CC_BREAKING_THRESHOLD` | `0.85` | Probability needed to add `!` |
-| `JEV_CC_BASE_URL` | `https://api.typesafe.ai` | |
-| `JEV_CC_DISABLE` | | Set to `1` to skip the hook |
+Settings are read from these places, each overriding the one before:
+
+1. `~/.config/jev-cc/config.toml`, for your own defaults
+2. `.jev-cc.toml` at the repository root, for settings shared with your team
+3. environment variables
+
+```toml
+# .jev-cc.toml
+min_confidence = 0.75
+exclude = ["secrets/**", "**/*.pem"]
+```
+
+| Setting | Environment variable | Default | |
+|---|---|---|---|
+| `timeout_ms` | `JEV_CC_TIMEOUT_MS` | `1000` | Request timeout |
+| `deadline_ms` | `JEV_CC_DEADLINE_MS` | `2000` | Time limit for the whole hook |
+| `min_confidence` | `JEV_CC_MIN_CONFIDENCE` | `0.6` | Minimum confidence to apply a type |
+| `breaking_threshold` | `JEV_CC_BREAKING_THRESHOLD` | `0.85` | Probability needed to add `!` |
+| `disable` | `JEV_CC_DISABLE` | `false` | |
+| `exclude` | | `[]` | Paths never sent to Jev |
+| `base_url` | `JEV_CC_BASE_URL` | `https://api.typesafe.ai` | Global config only |
+
+`exclude` patterns are
+[git glob pathspecs](https://git-scm.com/docs/gitglossary#Documentation/gitglossary.txt-aiddefpathspecapathspec),
+relative to the repository root. `*` doesn't match across directories, so use `**/*.pem` to
+match at any depth. A project's patterns are added to your global ones.
+
+`base_url` can't be set in `.jev-cc.toml`, so a repository you clone can't send your diffs
+and API key somewhere else.
+
+Run `jev-cc config` to see the settings in effect and where each one comes from.
+`TYPESAFE_API_KEY` overrides the key saved by `jev-cc login`.
 
 ## Classification
 
@@ -92,18 +115,19 @@ fix(config): handle empty config files
 ## Privacy
 
 When the local rules can't decide, jev-cc sends the following to TypeSafe
-(`api.typesafe.ai`, or `JEV_CC_BASE_URL`):
+(`api.typesafe.ai`, or your `base_url`):
 
-- the paths of your staged files
-- the staged patch, trimmed to about 24 KB, with lockfile and binary contents left out
+- the paths of your staged files, except those matched by `exclude`
+- the patch for those files, trimmed to about 24 KB, with lockfile and binary contents left
+  out
 - your commit message, if you've written one
 
 The repository name, remote, branch and author are not sent. Diffs that only touch docs,
 tests or CI config aren't sent anywhere.
 
-Any secrets in your staged changes are sent along with the patch. Catch them first with a
-secret scanner in a `pre-commit` hook, and don't install jev-cc in repositories whose code
-can't leave your machine.
+Any secrets in your staged changes are sent along with the patch. Keep sensitive paths out
+with `exclude`, catch secrets elsewhere with a secret scanner in a `pre-commit` hook, and
+don't install jev-cc in repositories whose code can't leave your machine.
 
 ## Development
 
