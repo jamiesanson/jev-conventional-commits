@@ -20,16 +20,7 @@ confident it is. That suits this tool:
 - **Local rules** pick the `scope` from the paths you changed, and skip the model call
   when the answer is obvious (for example, a docs-only diff).
 
-If the model isn't confident enough, times out, or can't be reached, your message is left
-unchanged. The hook never blocks a commit.
-
-## Design goals
-
-- **Fast.** A single static Rust binary with no async runtime, and one HTTPS request per
-  commit. The model call is the only noticeable cost.
-- **Safe to fail.** Every error path leaves the message as it was and exits 0.
-- **Out of the way.** Skips merges, squashes, amends, and messages that are already
-  conventional.
+If the model isn't confident enough, or can't be reached, your message is left unchanged.
 
 ## Install
 
@@ -56,16 +47,11 @@ export TYPESAFE_API_KEY=...   # from TypeSafe
 jev-cc install
 ```
 
-`install` adds two hooks to the repository:
+With `git commit -m`, the prefix goes in front of your message. With the editor, the first
+line is pre-filled (e.g. `fix(config): `) for you to finish.
 
-- `prepare-commit-msg` classifies the staged diff and adds the prefix. With `git commit -m`
-  the prefix goes in front of your message. With the editor, the first line is pre-filled
-  (e.g. `fix(config): `) for you to finish.
-- `commit-msg` clears a message that is only the pre-filled prefix, so quitting the editor
-  without writing anything still aborts the commit.
-
-If a hook already exists, `install` won't overwrite it. Add `jev-cc <hook> "$@"` to it
-yourself.
+`install` won't overwrite existing `prepare-commit-msg` or `commit-msg` hooks. Add
+`jev-cc <hook> "$@"` to them yourself.
 
 Try it without committing:
 
@@ -80,9 +66,9 @@ fix(config): handle empty config files
 
 | Variable | Default | |
 |---|---|---|
-| `TYPESAFE_API_KEY` | | Required for anything the local rules can't decide |
-| `JEV_CC_TIMEOUT_MS` | `1000` | The message is left unchanged on timeout |
-| `JEV_CC_MIN_CONFIDENCE` | `0.6` | Below this, the message is left unchanged |
+| `TYPESAFE_API_KEY` | | |
+| `JEV_CC_TIMEOUT_MS` | `1000` | |
+| `JEV_CC_MIN_CONFIDENCE` | `0.6` | Minimum confidence to apply a type |
 | `JEV_CC_BREAKING_THRESHOLD` | `0.85` | Probability needed to add `!` |
 | `JEV_CC_BASE_URL` | `https://api.typesafe.ai` | |
 | `JEV_CC_DISABLE` | | Set to `1` to skip the hook |
@@ -109,12 +95,6 @@ cargo test
 cargo build --release
 ./target/release/jev-cc install   # dogfood: classify this repo's own commits
 ```
-
-Hooks call `jev-cc` by absolute path, so they also work from git GUIs that don't use your
-shell's `PATH`. For a binary installed on `PATH`, that's the `PATH` entry (for example
-`~/.cargo/bin/jev-cc`), which stays valid across upgrades. For a local build, as above, it's
-the build output. If that path goes away, the hook looks up `jev-cc` on `PATH`, and does
-nothing if it isn't found.
 
 ### Releasing
 
