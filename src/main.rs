@@ -1,4 +1,5 @@
 mod classify;
+mod config;
 mod credentials;
 mod diff;
 mod jev;
@@ -9,6 +10,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use classify::{Classification, Settings};
+use config::Config;
 
 const USAGE: &str = "\
 jev-cc: prefix commit messages with Conventional Commits syntax using TypeSafe's Jev
@@ -18,10 +20,15 @@ USAGE:
     jev-cc logout                        Remove the saved API key
     jev-cc install                       Install the git hooks into the current repository
     jev-cc classify [MESSAGE]            Classify the staged diff and print the prefix
+    jev-cc config                        Show the settings in effect and where each comes from
     jev-cc prepare-commit-msg FILE [SOURCE] [SHA]   (git hook)
     jev-cc commit-msg FILE                          (git hook)
 
-ENVIRONMENT:
+CONFIGURATION:
+    Global:  ~/.config/jev-cc/config.toml
+    Project: .jev-cc.toml at the repository root (can't set base_url)
+    Environment variables override both:
+
     TYPESAFE_API_KEY             API key for Jev; overrides the key saved by `jev-cc login`
     JEV_CC_BASE_URL              API base URL (default: https://api.typesafe.ai)
     JEV_CC_TIMEOUT_MS            Request timeout; the message is left as-is on timeout (default: 1000)
@@ -44,20 +51,22 @@ fn main() -> ExitCode {
 
     match args.as_slice() {
         ["prepare-commit-msg", file, rest @ ..] => {
-            start_deadline(Path::new(file));
-            hook_result(prepare_commit_msg(Path::new(file), rest.first().copied()))
+            let config = hook_config();
+            start_deadline(Path::new(file), config.deadline_ms.value);
+            hook_result(prepare_commit_msg(
+                Path::new(file),
+                rest.first().copied(),
+                &config,
+            ))
         }
         ["commit-msg", file] => {
-            start_deadline(Path::new(file));
+            // prepare-commit-msg already reported any config warnings for this commit.
+            let config = config::load(std::env::current_dir().ok().as_deref());
+            start_deadline(Path::new(file), config.deadline_ms.value);
             hook_result(commit_msg(Path::new(file)))
         }
-        ["classify", message @ ..] => match run_classify(&message.join(" ")) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("jev-cc: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        ["classify", message @ ..] => command_result(run_classify(&message.join(" "))),
+        ["config"] => command_result(show_config()),
         ["install"] => command_result(install()),
         ["login"] => command_result(login()),
         ["logout"] => command_result(logout()),
@@ -90,11 +99,44 @@ fn hook_result(result: Result<(), String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Ends the hook after `JEV_CC_DEADLINE_MS`, whatever it's waiting on (git, DNS, the API),
-/// so jev-cc can never hang a commit. Message writes are atomic, so exiting at any point
+/// Git runs hooks from the repository root, so the project file is found without
+/// spawning git to locate it.
+fn hook_config() -> Config {
+    let config = config::load(std::env::current_dir().ok().as_deref());
+    print_warnings(&config);
+    config
+}
+
+/// For commands run by hand, possibly from a subdirectory.
+fn command_config() -> Config {
+    let config = config::load(repo_root().as_deref());
+    print_warnings(&config);
+    config
+}
+
+fn print_warnings(config: &Config) {
+    for warning in &config.warnings {
+        eprintln!("jev-cc: {warning}");
+    }
+}
+
+fn repo_root() -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+}
+
+/// Ends the hook after the deadline, whatever it's waiting on (git, DNS, the API), so
+/// jev-cc can never hang a commit. Message writes are atomic, so exiting at any point
 /// leaves either the original message or the prefixed one.
-fn start_deadline(message_file: &Path) {
-    let deadline = Duration::from_millis(env_f64("JEV_CC_DEADLINE_MS", 2000.0) as u64);
+fn start_deadline(message_file: &Path, deadline_ms: u64) {
+    let deadline = Duration::from_millis(deadline_ms);
     let tmp = tmp_path(message_file);
     std::thread::spawn(move || {
         std::thread::sleep(deadline);
@@ -107,8 +149,8 @@ fn start_deadline(message_file: &Path) {
     });
 }
 
-fn prepare_commit_msg(file: &Path, source: Option<&str>) -> Result<(), String> {
-    if env_flag("JEV_CC_DISABLE") {
+fn prepare_commit_msg(file: &Path, source: Option<&str>, config: &Config) -> Result<(), String> {
+    if config.disable.value {
         return Ok(());
     }
     // merge, squash and commit (-c/-C/--amend) reuse an existing message.
@@ -123,12 +165,12 @@ fn prepare_commit_msg(file: &Path, source: Option<&str>) -> Result<(), String> {
         return Ok(());
     }
 
-    let diff = diff::staged()?;
-    if diff.files.is_empty() {
+    let files = diff::staged_files()?;
+    if files.is_empty() {
         return Ok(());
     }
-    let classification = classify_with_env(&diff, &body)?;
-    let min_confidence = env_f64("JEV_CC_MIN_CONFIDENCE", 0.6);
+    let classification = classify_staged(&files, &body, config)?;
+    let min_confidence = config.min_confidence.value;
     if classification.confidence < min_confidence {
         return Err(format!(
             "best guess {} at {:.0}% confidence, below {:.0}%",
@@ -174,11 +216,12 @@ fn tmp_path(path: &Path) -> PathBuf {
 
 fn run_classify(message: &str) -> Result<(), String> {
     let started = Instant::now();
-    let diff = diff::staged()?;
-    if diff.files.is_empty() {
+    let config = command_config();
+    let files = diff::staged_files()?;
+    if files.is_empty() {
         return Err("nothing staged".into());
     }
-    let c = classify_with_env(&diff, message)?;
+    let c = classify_staged(&files, message, &config)?;
     println!("{}{message}", c.prefix());
     eprintln!(
         "  source: {:?}, confidence: {:.0}%, took {}ms",
@@ -189,21 +232,80 @@ fn run_classify(message: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn classify_with_env(diff: &diff::StagedDiff, message: &str) -> Result<Classification, String> {
+fn classify_staged(
+    files: &[diff::ChangedFile],
+    message: &str,
+    config: &Config,
+) -> Result<Classification, String> {
     let client = credentials::api_key().map(|key| {
-        let base =
-            std::env::var("JEV_CC_BASE_URL").unwrap_or_else(|_| jev::DEFAULT_BASE_URL.into());
-        let timeout = Duration::from_millis(env_f64("JEV_CC_TIMEOUT_MS", 1000.0) as u64);
-        jev::Client::new(key, &base, timeout)
+        let timeout = Duration::from_millis(config.timeout_ms.value);
+        jev::Client::new(key, &config.base_url.value, timeout)
     });
     let settings = Settings {
-        breaking_threshold: env_f64("JEV_CC_BREAKING_THRESHOLD", 0.85),
+        breaking_threshold: config.breaking_threshold.value,
     };
-    classify::classify(client.as_ref(), diff, message, &settings)
+    let exclude: Vec<String> = config.exclude.iter().map(|s| s.value.clone()).collect();
+    classify::classify(client.as_ref(), files, &exclude, message, &settings)
+}
+
+fn show_config() -> Result<(), String> {
+    let config = command_config();
+    let describe = |path: &Option<PathBuf>| match path {
+        Some(p) if p.is_file() => p.display().to_string(),
+        Some(p) => format!("{} (not found)", p.display()),
+        None => "(none)".to_string(),
+    };
+    println!("global   {}", describe(&config.global_path));
+    println!("project  {}", describe(&config.project_path));
+    println!();
+
+    let rows = [
+        (
+            "disable",
+            config.disable.value.to_string(),
+            config.disable.source,
+        ),
+        (
+            "base_url",
+            config.base_url.value.clone(),
+            config.base_url.source,
+        ),
+        (
+            "timeout_ms",
+            config.timeout_ms.value.to_string(),
+            config.timeout_ms.source,
+        ),
+        (
+            "deadline_ms",
+            config.deadline_ms.value.to_string(),
+            config.deadline_ms.source,
+        ),
+        (
+            "min_confidence",
+            config.min_confidence.value.to_string(),
+            config.min_confidence.source,
+        ),
+        (
+            "breaking_threshold",
+            config.breaking_threshold.value.to_string(),
+            config.breaking_threshold.source,
+        ),
+    ];
+    for (key, value, source) in rows {
+        println!("{key:<20}{value:<32}{source}");
+    }
+    if config.exclude.is_empty() {
+        println!("{:<20}{:<32}{}", "exclude", "[]", config::Source::Default);
+    }
+    for (i, pattern) in config.exclude.iter().enumerate() {
+        let key = if i == 0 { "exclude" } else { "" };
+        println!("{key:<20}{:<32}{}", pattern.value, pattern.source);
+    }
+    Ok(())
 }
 
 fn login() -> Result<(), String> {
-    let dir = credentials::dir().ok_or("couldn't find a config directory (HOME is not set)")?;
+    let dir = config::dir().ok_or("couldn't find a config directory (HOME is not set)")?;
     let key = read_key()?;
     if key.is_empty() {
         return Err("no key entered".into());
@@ -217,7 +319,7 @@ fn login() -> Result<(), String> {
 }
 
 fn logout() -> Result<(), String> {
-    let dir = credentials::dir().ok_or("couldn't find a config directory (HOME is not set)")?;
+    let dir = config::dir().ok_or("couldn't find a config directory (HOME is not set)")?;
     match credentials::delete(&dir)? {
         Some(path) => println!("removed {}", path.display()),
         None => println!("no saved API key"),
@@ -343,15 +445,4 @@ fn make_executable(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) -> Result<(), String> {
     Ok(())
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-}
-
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
 }
