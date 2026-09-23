@@ -28,6 +28,11 @@ ENVIRONMENT:
 ";
 
 const HOOK_MARKER: &str = "# installed by jev-cc";
+const BIN_NAME: &str = if cfg!(windows) {
+    "jev-cc.exe"
+} else {
+    "jev-cc"
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -167,16 +172,41 @@ fn install() -> Result<(), String> {
                 path.display()
             ));
         }
-        // A missing binary (uninstalled, `cargo clean`) must not block commits.
-        let script = format!(
-            "#!/bin/sh\n{HOOK_MARKER}\nbin=\"{}\"\n[ -x \"$bin\" ] || exit 0\nexec \"$bin\" {hook} \"$@\"\n",
-            exe.display()
-        );
-        std::fs::write(&path, script).map_err(|e| e.to_string())?;
+        std::fs::write(&path, hook_script(hook, &exe)).map_err(|e| e.to_string())?;
         make_executable(&path)?;
         println!("installed {}", path.display());
     }
     Ok(())
+}
+
+/// Hooks call `jev-cc` from PATH when that's the binary running `install`, so package
+/// manager upgrades (which move versioned install directories) keep working. Otherwise,
+/// such as for a local `target/release` build, they call the absolute path.
+/// Either way, a missing binary must not block commits.
+fn hook_script(hook: &str, exe: &Path) -> String {
+    let bin = match find_on_path(BIN_NAME) {
+        Some(found) if same_file(&found, exe) => BIN_NAME.to_string(),
+        _ => exe.display().to_string(),
+    };
+    format!(
+        "#!/bin/sh\n\
+         {HOOK_MARKER}\n\
+         command -v \"{bin}\" >/dev/null 2>&1 || exit 0\n\
+         exec \"{bin}\" {hook} \"$@\"\n"
+    )
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn git_hooks_dir() -> Result<PathBuf, String> {
