@@ -89,6 +89,22 @@ fix(config): handle empty config files
    such as `src/` and `packages/`. For example, changes only in `src/config/` get `(config)`.
    Changes at the root or across several directories get no scope.
 
+## Privacy
+
+When the local rules can't decide, jev-cc sends the following to TypeSafe
+(`api.typesafe.ai`, or `JEV_CC_BASE_URL`):
+
+- the paths of your staged files
+- the staged patch, trimmed to about 24 KB, with lockfile and binary contents left out
+- your commit message, if you've written one
+
+The repository name, remote, branch and author are not sent. Diffs that only touch docs,
+tests or CI config aren't sent anywhere.
+
+Any secrets in your staged changes are sent along with the patch. Catch them first with a
+secret scanner in a `pre-commit` hook, and don't install jev-cc in repositories whose code
+can't leave your machine.
+
 ## Development
 
 ```sh
