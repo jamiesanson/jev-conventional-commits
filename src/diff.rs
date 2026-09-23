@@ -115,7 +115,7 @@ fn trim_patch(patch: &str) -> String {
             break;
         }
         let header = section.lines().next().unwrap_or_default();
-        if is_noise(header) || section.contains("\nBinary files ") {
+        if is_lockfile(header) || section.contains("\nBinary files ") {
             out.push_str(header);
             out.push_str("\n[contents omitted]\n");
             continue;
@@ -142,20 +142,22 @@ fn split_files(patch: &str) -> Vec<&str> {
     starts.windows(2).map(|w| &patch[w[0]..w[1]]).collect()
 }
 
-fn is_noise(header: &str) -> bool {
-    const LOCKFILES: &[&str] = &[
-        "Cargo.lock",
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "bun.lockb",
-        "Gemfile.lock",
-        "poetry.lock",
-        "uv.lock",
-        "go.sum",
-        "composer.lock",
-    ];
-    LOCKFILES.iter().any(|f| header.ends_with(&format!("/{f}")))
+const LOCKFILES: &[&str] = &[
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lockb",
+    "Gemfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "go.sum",
+    "composer.lock",
+];
+
+/// Also accepts a `diff --git a/… b/…` header, which ends with the destination path.
+pub fn is_lockfile(path: &str) -> bool {
+    LOCKFILES.contains(&path.rsplit('/').next().unwrap_or(path))
 }
 
 fn floor_char_boundary(s: &str, mut i: usize) -> usize {
