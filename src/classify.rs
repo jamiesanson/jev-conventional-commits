@@ -4,29 +4,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::config::{ScopeRule, TypeDef};
 use crate::diff::{self, ChangedFile, Outgoing};
 use crate::jev::{self, Answer, NoulCriteria, Question};
-
-/// Conventional commit types and the criteria Jev uses to tell them apart.
-pub const TYPES: &[(&str, &str)] = &[
-    ("feat", "Adds new user-facing behaviour or capability"),
-    ("fix", "Corrects a bug or wrong behaviour"),
-    ("docs", "Changes documentation only"),
-    (
-        "style",
-        "Formatting or whitespace only; no change in behaviour",
-    ),
-    ("refactor", "Restructures code without changing behaviour"),
-    ("perf", "Improves performance without changing behaviour"),
-    ("test", "Adds or changes tests only"),
-    (
-        "build",
-        "Changes the build system, packaging or dependencies",
-    ),
-    ("ci", "Changes CI configuration or pipelines"),
-    ("chore", "Maintenance that doesn't fit another type"),
-    ("revert", "Reverts an earlier commit"),
-];
 
 const TYPE_INSTRUCTIONS: &str =
     "Which Conventional Commits type best describes the primary purpose of this staged change?";
@@ -42,7 +22,7 @@ pub enum Source {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Classification {
-    pub kind: &'static str,
+    pub kind: String,
     pub scope: Option<String>,
     pub breaking: bool,
     pub confidence: f64,
@@ -62,9 +42,13 @@ impl Classification {
     }
 }
 
-pub struct Settings {
+pub struct Settings<'a> {
     /// Probability above which a change is marked breaking.
     pub breaking_threshold: f64,
+    /// The types Jev may choose from. Local rules only answer with types in this list.
+    pub types: &'a [TypeDef],
+    /// When non-empty, replaces the shared-directory guess for the scope.
+    pub scopes: &'a [ScopeRule],
 }
 
 pub fn classify(
@@ -74,11 +58,11 @@ pub fn classify(
     message: &str,
     settings: &Settings,
 ) -> Result<Classification, String> {
-    let scope = scope_for(files);
+    let scope = scope_for(files, settings.scopes);
 
-    if let Some(kind) = local_type(files) {
+    if let Some(kind) = local_type(files, settings.types) {
         return Ok(Classification {
-            kind,
+            kind: kind.to_string(),
             scope,
             breaking: false,
             confidence: 1.0,
@@ -92,14 +76,15 @@ pub fn classify(
         return Err("every changed file is excluded".into());
     }
     let response = client
-        .system_one(&request(&outgoing, message))
+        .system_one(&request(&outgoing, message, settings.types))
         .map_err(|e| e.to_string())?;
 
     let (kind, confidence) = match response.answers.get("type") {
-        Some(Answer::Choice { choice, confidence }) => TYPES
+        Some(Answer::Choice { choice, confidence }) => settings
+            .types
             .iter()
-            .find(|(t, _)| t == choice)
-            .map(|(t, _)| (*t, *confidence))
+            .find(|t| &t.name == choice)
+            .map(|t| (t.name.clone(), *confidence))
             .ok_or_else(|| format!("unexpected type from Jev: {choice}"))?,
         _ => return Err("response had no type answer".into()),
     };
@@ -117,7 +102,7 @@ pub fn classify(
     })
 }
 
-fn request<'a>(outgoing: &Outgoing, message: &str) -> jev::Request<'a> {
+fn request<'a>(outgoing: &Outgoing, message: &str, types: &'a [TypeDef]) -> jev::Request<'a> {
     let files: Vec<String> = outgoing
         .files
         .iter()
@@ -133,7 +118,10 @@ fn request<'a>(outgoing: &Outgoing, message: &str) -> jev::Request<'a> {
         "type",
         Question::Choice {
             instructions: TYPE_INSTRUCTIONS,
-            criteria: TYPES.iter().copied().collect(),
+            criteria: types
+                .iter()
+                .map(|t| (t.name.as_str(), t.description.as_str()))
+                .collect(),
         },
     );
     questions.insert(
@@ -154,21 +142,23 @@ fn request<'a>(outgoing: &Outgoing, message: &str) -> jev::Request<'a> {
     }
 }
 
-/// Answers without the model when every changed file points the same way.
-fn local_type(files: &[ChangedFile]) -> Option<&'static str> {
+/// Answers without the model when every changed file points the same way, and that
+/// type is allowed.
+fn local_type(files: &[ChangedFile], types: &[TypeDef]) -> Option<&'static str> {
     if files.is_empty() {
         return None;
     }
     let all = |f: fn(&str) -> bool| files.iter().all(|c| f(&c.path));
-    if all(is_docs) {
-        Some("docs")
+    let kind = if all(is_docs) {
+        "docs"
     } else if all(is_test) {
-        Some("test")
+        "test"
     } else if all(is_ci) {
-        Some("ci")
+        "ci"
     } else {
-        None
-    }
+        return None;
+    };
+    types.iter().any(|t| t.name == kind).then_some(kind)
 }
 
 fn is_docs(path: &str) -> bool {
@@ -201,9 +191,37 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// The directory every changed file shares, skipping container directories like `src/`.
-/// Files at the repository root, or spread across directories, get no scope.
-fn scope_for(files: &[ChangedFile]) -> Option<String> {
+/// The scope every changed file agrees on, ignoring lockfiles, which follow changes
+/// elsewhere. With configured `scopes`, each file's longest matching path prefix decides;
+/// otherwise it's the directory the files share. Disagreement means no scope.
+fn scope_for(files: &[ChangedFile], rules: &[ScopeRule]) -> Option<String> {
+    let files: Vec<&ChangedFile> = files
+        .iter()
+        .filter(|f| !diff::is_lockfile(&f.path))
+        .collect();
+    if rules.is_empty() {
+        shared_directory(&files)
+    } else {
+        let mut scopes = files.iter().map(|f| mapped_scope(&f.path, rules));
+        let first = scopes.next()??;
+        scopes.all(|s| s == Some(first)).then(|| first.to_string())
+    }
+}
+
+/// `rules` is sorted longest prefix first. Prefixes match whole path components.
+fn mapped_scope<'a>(path: &str, rules: &'a [ScopeRule]) -> Option<&'a str> {
+    rules
+        .iter()
+        .find(|r| {
+            path.strip_prefix(r.prefix.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+        .map(|r| r.scope.as_str())
+}
+
+/// The directory every file shares, skipping container directories like `src/`. Files at
+/// the repository root, or spread across directories, get no scope.
+fn shared_directory(files: &[&ChangedFile]) -> Option<String> {
     const CONTAINERS: &[&str] = &[
         "src", "lib", "crates", "packages", "apps", "pkg", "internal",
     ];
@@ -220,6 +238,7 @@ fn scope_for(files: &[ChangedFile]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{self, Source as ConfigSource};
 
     fn files(paths: &[&str]) -> Vec<ChangedFile> {
         paths
@@ -231,54 +250,136 @@ mod tests {
             .collect()
     }
 
+    fn types(names: &[&str]) -> Vec<TypeDef> {
+        config::built_in_types()
+            .into_iter()
+            .filter(|t| names.contains(&t.name.as_str()))
+            .collect()
+    }
+
+    fn rules(pairs: &[(&str, &str)]) -> Vec<ScopeRule> {
+        let mut rules: Vec<ScopeRule> = pairs
+            .iter()
+            .map(|(prefix, scope)| ScopeRule {
+                prefix: prefix.to_string(),
+                scope: scope.to_string(),
+                source: ConfigSource::Project,
+            })
+            .collect();
+        rules.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
+        rules
+    }
+
     #[test]
     fn docs_only_is_local() {
+        let all = config::built_in_types();
         assert_eq!(
-            local_type(&files(&["README.md", "docs/setup.txt"])),
+            local_type(&files(&["README.md", "docs/setup.txt"]), &all),
             Some("docs")
         );
     }
 
     #[test]
     fn tests_only_is_local() {
+        let all = config::built_in_types();
         assert_eq!(
-            local_type(&files(&[
-                "tests/cli.rs",
-                "src/app.test.ts",
-                "pkg/x_test.go"
-            ])),
+            local_type(
+                &files(&["tests/cli.rs", "src/app.test.ts", "pkg/x_test.go"]),
+                &all
+            ),
             Some("test")
         );
     }
 
     #[test]
     fn mixed_change_needs_model() {
-        assert_eq!(local_type(&files(&["README.md", "src/main.rs"])), None);
+        let all = config::built_in_types();
+        assert_eq!(
+            local_type(&files(&["README.md", "src/main.rs"]), &all),
+            None
+        );
+    }
+
+    #[test]
+    fn local_rules_respect_allowed_types() {
+        let no_docs = types(&["feat", "fix", "chore"]);
+        assert_eq!(local_type(&files(&["README.md"]), &no_docs), None);
     }
 
     #[test]
     fn scope_from_shared_directory() {
         assert_eq!(
-            scope_for(&files(&["src/config/load.rs", "src/config/mod.rs"])),
+            scope_for(&files(&["src/config/load.rs", "src/config/mod.rs"]), &[]),
             Some("config".into())
         );
         assert_eq!(
-            scope_for(&files(&["packages/api/src/index.ts"])),
+            scope_for(&files(&["packages/api/src/index.ts"]), &[]),
             Some("api".into())
         );
     }
 
     #[test]
     fn no_scope_for_root_or_spread_changes() {
-        assert_eq!(scope_for(&files(&["src/main.rs"])), None);
-        assert_eq!(scope_for(&files(&["src/a/x.rs", "src/b/y.rs"])), None);
-        assert_eq!(scope_for(&files(&["Cargo.toml", "src/a/x.rs"])), None);
+        assert_eq!(scope_for(&files(&["src/main.rs"]), &[]), None);
+        assert_eq!(scope_for(&files(&["src/a/x.rs", "src/b/y.rs"]), &[]), None);
+        assert_eq!(scope_for(&files(&["Cargo.toml", "src/a/x.rs"]), &[]), None);
+    }
+
+    #[test]
+    fn lockfiles_dont_affect_scope() {
+        assert_eq!(
+            scope_for(&files(&["src/config/load.rs", "Cargo.lock"]), &[]),
+            Some("config".into())
+        );
+        let web = rules(&[("packages/web", "web")]);
+        assert_eq!(
+            scope_for(&files(&["packages/web/app.ts", "pnpm-lock.yaml"]), &web),
+            Some("web".into())
+        );
+        assert_eq!(scope_for(&files(&["Cargo.lock"]), &[]), None);
+    }
+
+    #[test]
+    fn configured_scopes_use_longest_prefix() {
+        let r = rules(&[("packages/web", "web"), ("packages/web/admin", "admin")]);
+        assert_eq!(
+            scope_for(&files(&["packages/web/admin/users.ts"]), &r),
+            Some("admin".into())
+        );
+        assert_eq!(
+            scope_for(&files(&["packages/web/index.ts"]), &r),
+            Some("web".into())
+        );
+    }
+
+    #[test]
+    fn configured_scopes_match_whole_path_components() {
+        let r = rules(&[("packages/web", "web")]);
+        assert_eq!(scope_for(&files(&["packages/website/a.ts"]), &r), None);
+        assert_eq!(scope_for(&files(&["packages/web"]), &r), Some("web".into()));
+    }
+
+    #[test]
+    fn configured_scopes_replace_shared_directory() {
+        let r = rules(&[("packages/web", "web")]);
+        // Would be `config` from the shared directory, but no rule matches.
+        assert_eq!(scope_for(&files(&["src/config/load.rs"]), &r), None);
+        // Files mapping to different scopes, or to none, get no scope.
+        let r = rules(&[("packages/web", "web"), ("packages/api", "api")]);
+        assert_eq!(
+            scope_for(&files(&["packages/web/a.ts", "packages/api/b.ts"]), &r),
+            None
+        );
+        assert_eq!(
+            scope_for(&files(&["packages/web/a.ts", "README.md"]), &r),
+            None
+        );
     }
 
     #[test]
     fn prefix_formatting() {
         let c = Classification {
-            kind: "feat",
+            kind: "feat".into(),
             scope: Some("api".into()),
             breaking: true,
             confidence: 0.9,

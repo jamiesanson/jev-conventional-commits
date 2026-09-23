@@ -8,6 +8,9 @@
 //! The project file comes with whatever repository you clone, so it can't set anything
 //! that changes where your diffs and API key are sent (`base_url`), and its `exclude`
 //! patterns add to the global ones rather than replacing them.
+//!
+//! `types` is a whole set, so the project's list replaces the global one. `scopes` entries
+//! combine, with the project winning on the same prefix.
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -54,6 +57,44 @@ impl Display for Source {
     }
 }
 
+/// Conventional commit types and the criteria Jev uses to tell them apart.
+pub const BUILT_IN_TYPES: &[(&str, &str)] = &[
+    ("feat", "Adds new user-facing behaviour or capability"),
+    ("fix", "Corrects a bug or wrong behaviour"),
+    ("docs", "Changes documentation only"),
+    (
+        "style",
+        "Formatting or whitespace only; no change in behaviour",
+    ),
+    ("refactor", "Restructures code without changing behaviour"),
+    ("perf", "Improves performance without changing behaviour"),
+    ("test", "Adds or changes tests only"),
+    (
+        "build",
+        "Changes the build system, packaging or dependencies",
+    ),
+    ("ci", "Changes CI configuration or pipelines"),
+    ("chore", "Maintenance that doesn't fit another type"),
+    ("revert", "Reverts an earlier commit"),
+];
+
+/// Jev's limit on options for a single question.
+const MAX_TYPES: usize = 255;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDef {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeRule {
+    /// Repository-relative directory or file, without leading or trailing slashes.
+    pub prefix: String,
+    pub scope: String,
+    pub source: Source,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Setting<T> {
     pub value: T,
@@ -71,6 +112,9 @@ pub struct Config {
     /// Git glob pathspecs, relative to the repository root. Global and project patterns
     /// combined.
     pub exclude: Vec<Setting<String>>,
+    pub types: Setting<Vec<TypeDef>>,
+    /// Longest prefix first, so the first match is the most specific.
+    pub scopes: Vec<ScopeRule>,
     pub global_path: Option<PathBuf>,
     pub project_path: Option<PathBuf>,
     /// Problems found while loading. Loading never fails; bad values are skipped.
@@ -87,8 +131,21 @@ struct File {
     breaking_threshold: Option<f64>,
     #[serde(default)]
     exclude: Vec<String>,
+    types: Option<TypesField>,
+    #[serde(default)]
+    scopes: BTreeMap<String, String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, IgnoredAny>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    untagged,
+    expecting = "a list of built-in type names, or a table of type names to descriptions"
+)]
+enum TypesField {
+    Names(Vec<String>),
+    Described(BTreeMap<String, String>),
 }
 
 /// Loads every layer. `project_root` is the repository's top-level directory, if any.
@@ -207,6 +264,45 @@ fn resolve(
         }))
         .collect();
 
+    let types = match (
+        project
+            .types
+            .and_then(|t| type_defs(t, PROJECT_FILE, &mut warnings)),
+        global
+            .types
+            .and_then(|t| type_defs(t, "the global config", &mut warnings)),
+    ) {
+        (Some(value), _) => Setting {
+            value,
+            source: Source::Project,
+        },
+        (None, Some(value)) => Setting {
+            value,
+            source: Source::Global,
+        },
+        (None, None) => Setting {
+            value: built_in_types(),
+            source: Source::Default,
+        },
+    };
+
+    let mut scopes: BTreeMap<String, ScopeRule> = BTreeMap::new();
+    for (entries, source, label) in [
+        (global.scopes, Source::Global, "the global config"),
+        (project.scopes, Source::Project, PROJECT_FILE),
+    ] {
+        for (prefix, scope) in entries {
+            match scope_rule(&prefix, scope, source) {
+                Ok(rule) => {
+                    scopes.insert(rule.prefix.clone(), rule);
+                }
+                Err(e) => warnings.push(format!("ignoring scope for `{prefix}` in {label}: {e}")),
+            }
+        }
+    }
+    let mut scopes: Vec<ScopeRule> = scopes.into_values().collect();
+    scopes.sort_by_key(|rule| std::cmp::Reverse(rule.prefix.len()));
+
     Config {
         disable,
         base_url,
@@ -215,10 +311,97 @@ fn resolve(
         min_confidence,
         breaking_threshold,
         exclude,
+        types,
+        scopes,
         global_path: None,
         project_path: None,
         warnings,
     }
+}
+
+pub fn built_in_types() -> Vec<TypeDef> {
+    BUILT_IN_TYPES
+        .iter()
+        .map(|(name, description)| TypeDef {
+            name: name.to_string(),
+            description: description.to_string(),
+        })
+        .collect()
+}
+
+/// Type names must be lowercase letters, so jev-cc recognises its own prefixes later.
+fn valid_type_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase())
+}
+
+/// Returns `None`, with a warning, when no usable types remain.
+fn type_defs(field: TypesField, label: &str, warnings: &mut Vec<String>) -> Option<Vec<TypeDef>> {
+    let built_in = |name: &str| {
+        BUILT_IN_TYPES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, d)| d.to_string())
+    };
+    let entries: Vec<(String, Option<String>)> = match field {
+        TypesField::Names(names) => names.into_iter().map(|n| (n, None)).collect(),
+        TypesField::Described(map) => map
+            .into_iter()
+            .map(|(n, d)| (n, Some(d).filter(|d| !d.trim().is_empty())))
+            .collect(),
+    };
+
+    let mut defs: Vec<TypeDef> = Vec::new();
+    for (name, description) in entries {
+        if !valid_type_name(&name) {
+            warnings.push(format!(
+                "ignoring type `{name}` in {label}: type names must be lowercase letters"
+            ));
+            continue;
+        }
+        let Some(description) = description.or_else(|| built_in(&name)) else {
+            warnings.push(format!(
+                "ignoring type `{name}` in {label}: it isn't built in, so it needs a description \
+                 (`[types]` table, e.g. {name} = \"...\")"
+            ));
+            continue;
+        };
+        if !defs.iter().any(|d| d.name == name) {
+            defs.push(TypeDef { name, description });
+        }
+    }
+
+    if defs.is_empty() {
+        warnings.push(format!("ignoring `types` in {label}: no usable types"));
+        return None;
+    }
+    if defs.len() > MAX_TYPES {
+        warnings.push(format!(
+            "ignoring `types` in {label}: at most {MAX_TYPES} types are allowed"
+        ));
+        return None;
+    }
+    Some(defs)
+}
+
+fn scope_rule(prefix: &str, scope: String, source: Source) -> Result<ScopeRule, String> {
+    let prefix = prefix
+        .trim()
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_string();
+    if prefix.is_empty() {
+        return Err("the path is empty".into());
+    }
+    if scope.is_empty() || scope.contains(|c: char| c.is_whitespace() || c == '(' || c == ')') {
+        return Err(format!(
+            "`{scope}` isn't a valid scope (no spaces or parentheses)"
+        ));
+    }
+    Ok(ScopeRule {
+        prefix,
+        scope,
+        source,
+    })
 }
 
 fn layer<T: EnvValue>(
@@ -376,6 +559,79 @@ mod tests {
                 ("secrets/**", Source::Project)
             ]
         );
+    }
+
+    #[test]
+    fn default_types_are_built_in() {
+        let c = resolve(None, None, &no_env, vec![]);
+        assert_eq!(c.types.source, Source::Default);
+        assert_eq!(c.types.value.len(), BUILT_IN_TYPES.len());
+    }
+
+    #[test]
+    fn project_types_replace_global_types() {
+        let global = file("types = [\"feat\", \"fix\", \"chore\"]");
+        let project = file("types = [\"feat\", \"fix\"]");
+        let c = resolve(Some(global), Some(project), &no_env, vec![]);
+        assert_eq!(c.types.source, Source::Project);
+        let names: Vec<_> = c.types.value.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["feat", "fix"]);
+        assert_eq!(c.types.value[0].description, BUILT_IN_TYPES[0].1);
+    }
+
+    #[test]
+    fn custom_types_need_descriptions() {
+        let project = file("[types]\nfeat = \"\"\ndeps = \"Updates dependencies\"\n");
+        let c = resolve(None, Some(project), &no_env, vec![]);
+        let names: Vec<_> = c.types.value.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["deps", "feat"]);
+        assert_eq!(c.types.value[0].description, "Updates dependencies");
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+
+        let project = file("types = [\"feat\", \"deps\", \"Bad-Name\"]");
+        let c = resolve(None, Some(project), &no_env, vec![]);
+        assert_eq!(c.types.value.len(), 1);
+        assert_eq!(c.warnings.len(), 2, "{:?}", c.warnings);
+        assert!(c.warnings[0].contains("`deps`"));
+        assert!(c.warnings[1].contains("`Bad-Name`"));
+    }
+
+    #[test]
+    fn unusable_project_types_fall_back_to_global() {
+        let global = file("types = [\"feat\", \"fix\"]");
+        let project = file("types = [\"Nope\"]");
+        let c = resolve(Some(global), Some(project), &no_env, vec![]);
+        assert_eq!(c.types.source, Source::Global);
+        assert!(c.warnings.iter().any(|w| w.contains("no usable types")));
+    }
+
+    #[test]
+    fn scopes_combine_and_sort_longest_first() {
+        let global = file("[scopes]\n\"packages/web\" = \"frontend\"\n\"docs\" = \"docs\"\n");
+        let project =
+            file("[scopes]\n\"./packages/web/\" = \"web\"\n\"packages/web/admin\" = \"admin\"\n");
+        let c = resolve(Some(global), Some(project), &no_env, vec![]);
+        let rules: Vec<_> = c
+            .scopes
+            .iter()
+            .map(|r| (r.prefix.as_str(), r.scope.as_str(), r.source))
+            .collect();
+        assert_eq!(
+            rules,
+            vec![
+                ("packages/web/admin", "admin", Source::Project),
+                ("packages/web", "web", Source::Project),
+                ("docs", "docs", Source::Global),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_scopes_are_skipped() {
+        let project = file("[scopes]\n\"/\" = \"root\"\n\"api\" = \"public api\"\n");
+        let c = resolve(None, Some(project), &no_env, vec![]);
+        assert!(c.scopes.is_empty());
+        assert_eq!(c.warnings.len(), 2, "{:?}", c.warnings);
     }
 
     #[test]

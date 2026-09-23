@@ -243,6 +243,8 @@ fn classify_staged(
     });
     let settings = Settings {
         breaking_threshold: config.breaking_threshold.value,
+        types: &config.types.value,
+        scopes: &config.scopes,
     };
     let exclude: Vec<String> = config.exclude.iter().map(|s| s.value.clone()).collect();
     classify::classify(client.as_ref(), files, &exclude, message, &settings)
@@ -292,14 +294,34 @@ fn show_config() -> Result<(), String> {
         ),
     ];
     for (key, value, source) in rows {
-        println!("{key:<20}{value:<32}{source}");
+        println!("{key:<20}{value:<30}  {source}");
     }
     if config.exclude.is_empty() {
-        println!("{:<20}{:<32}{}", "exclude", "[]", config::Source::Default);
+        println!("{:<20}{:<30}  {}", "exclude", "[]", config::Source::Default);
     }
     for (i, pattern) in config.exclude.iter().enumerate() {
         let key = if i == 0 { "exclude" } else { "" };
-        println!("{key:<20}{:<32}{}", pattern.value, pattern.source);
+        println!("{key:<20}{:<30}  {}", pattern.value, pattern.source);
+    }
+    let types: Vec<&str> = config.types.value.iter().map(|t| t.name.as_str()).collect();
+    println!(
+        "{:<20}{:<30}  {}",
+        "types",
+        types.join(", "),
+        config.types.source
+    );
+    if config.scopes.is_empty() {
+        println!(
+            "{:<20}{:<30}  {}",
+            "scopes",
+            "(shared directory)",
+            config::Source::Default
+        );
+    }
+    for (i, rule) in config.scopes.iter().enumerate() {
+        let key = if i == 0 { "scopes" } else { "" };
+        let mapping = format!("{} → {}", rule.prefix, rule.scope);
+        println!("{key:<20}{mapping:<30}  {}", rule.source);
     }
     Ok(())
 }

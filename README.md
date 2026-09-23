@@ -74,6 +74,12 @@ Settings are read from these places, each overriding the one before:
 # .jev-cc.toml
 min_confidence = 0.75
 exclude = ["secrets/**", "**/*.pem"]
+types = ["feat", "fix", "docs", "refactor", "test", "chore"]
+
+[scopes]
+"packages/web" = "web"
+"packages/web/admin" = "admin"
+"packages/api" = "api"
 ```
 
 | Setting | Environment variable | Default | |
@@ -84,12 +90,30 @@ exclude = ["secrets/**", "**/*.pem"]
 | `breaking_threshold` | `JEV_CC_BREAKING_THRESHOLD` | `0.85` | Probability needed to add `!` |
 | `disable` | `JEV_CC_DISABLE` | `false` | |
 | `exclude` | | `[]` | Paths never sent to Jev |
+| `types` | | all built-in types | Types jev-cc may choose from |
+| `scopes` | | | Path prefixes mapped to scopes |
 | `base_url` | `JEV_CC_BASE_URL` | `https://api.typesafe.ai` | Global config only |
 
 `exclude` patterns are
 [git glob pathspecs](https://git-scm.com/docs/gitglossary#Documentation/gitglossary.txt-aiddefpathspecapathspec),
 relative to the repository root. `*` doesn't match across directories, so use `**/*.pem` to
 match at any depth. A project's patterns are added to your global ones.
+
+`types` lists built-in types by name. For your own types, use a table of names to
+descriptions. Jev uses the descriptions to tell types apart, and an empty description keeps
+the built-in one:
+
+```toml
+[types]
+feat = ""
+fix = ""
+deps = "Updates or adds third-party dependencies"
+```
+
+Type names must be lowercase letters. A project's `types` replace your global ones.
+
+`scopes` entries from both files are combined, and the project's entry wins when both set
+the same path.
 
 `base_url` can't be set in `.jev-cc.toml`, so a repository you clone can't send your diffs
 and API key somewhere else.
@@ -102,15 +126,19 @@ Run `jev-cc config` to see the settings in effect and where each one comes from.
 1. **Skip** merges, squashes, amends, `fixup!`/`squash!` commits, and messages that already
    start with `type:` or `type(scope):`.
 2. **Local rules.** If every changed file is documentation, a test or CI config, the type is
-   `docs`, `test` or `ci`, and no request is made.
+   `docs`, `test` or `ci`, and no request is made. This only applies when that type is in
+   `types`.
 3. **Jev.** Otherwise, one request asks two questions about the changed file list, a trimmed
    patch (lockfiles and binaries omitted, about 24 KB at most) and your message:
-   - `type`: a choice between `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
-     `build`, `ci`, `chore` and `revert`
+   - `type`: a choice between your `types`, or by default `feat`, `fix`, `docs`, `style`,
+     `refactor`, `perf`, `test`, `build`, `ci`, `chore` and `revert`
    - `breaking`: yes or no
-4. **Scope** is the directory every changed file shares, skipping container directories
-   such as `src/` and `packages/`. For example, changes only in `src/config/` get `(config)`.
-   Changes at the root or across several directories get no scope.
+4. **Scope.** With `scopes` configured, each changed file takes the scope of its longest
+   matching path, so `packages/web/admin/users.ts` gets `(admin)` in the example above.
+   Without `scopes`, it's the directory every changed file shares, skipping container
+   directories such as `src/` and `packages/`, so changes only in `src/config/` get
+   `(config)`. If the files disagree, there's no scope. Lockfiles are ignored, because they
+   change along with whatever they belong to.
 
 ## Privacy
 
