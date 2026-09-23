@@ -110,8 +110,11 @@ cargo build --release
 ./target/release/jev-cc install   # dogfood: classify this repo's own commits
 ```
 
-Hooks installed from a binary on `PATH` call `jev-cc` by name, so upgrades keep working.
-Hooks installed from a local build, as above, call it by absolute path.
+Hooks call `jev-cc` by absolute path, so they also work from git GUIs that don't use your
+shell's `PATH`. For a binary installed on `PATH`, that's the `PATH` entry (for example
+`~/.cargo/bin/jev-cc`), which stays valid across upgrades. For a local build, as above, it's
+the build output. If that path goes away, the hook looks up `jev-cc` on `PATH`, and does
+nothing if it isn't found.
 
 ### Releasing
 
