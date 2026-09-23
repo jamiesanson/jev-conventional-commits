@@ -71,7 +71,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::MissingApiKey => write!(f, "TYPESAFE_API_KEY is not set"),
+            Error::MissingApiKey => write!(f, "no API key; run `jev-cc login`"),
             Error::Http(e) => write!(f, "request failed: {e}"),
             Error::Status(code, body) => write!(f, "API returned {code}: {body}"),
         }

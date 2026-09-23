@@ -1,10 +1,11 @@
 mod classify;
+mod credentials;
 mod diff;
 mod jev;
 mod message;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use classify::{Classification, Settings};
@@ -13,13 +14,15 @@ const USAGE: &str = "\
 jev-cc: prefix commit messages with Conventional Commits syntax using TypeSafe's Jev
 
 USAGE:
+    jev-cc login                         Save your TypeSafe API key
+    jev-cc logout                        Remove the saved API key
     jev-cc install                       Install the git hooks into the current repository
     jev-cc classify [MESSAGE]            Classify the staged diff and print the prefix
     jev-cc prepare-commit-msg FILE [SOURCE] [SHA]   (git hook)
     jev-cc commit-msg FILE                          (git hook)
 
 ENVIRONMENT:
-    TYPESAFE_API_KEY             API key for Jev (required for anything local rules can't decide)
+    TYPESAFE_API_KEY             API key for Jev; overrides the key saved by `jev-cc login`
     JEV_CC_BASE_URL              API base URL (default: https://api.typesafe.ai)
     JEV_CC_TIMEOUT_MS            Request timeout; the message is left as-is on timeout (default: 1000)
     JEV_CC_DEADLINE_MS           Time limit for the whole hook (default: 2000)
@@ -55,13 +58,9 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        ["install"] => match install() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("jev-cc: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        ["install"] => command_result(install()),
+        ["login"] => command_result(login()),
+        ["logout"] => command_result(logout()),
         ["--version" | "-V"] => {
             println!("jev-cc {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -69,6 +68,16 @@ fn main() -> ExitCode {
         _ => {
             eprint!("{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn command_result(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("jev-cc: {e}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -181,20 +190,72 @@ fn run_classify(message: &str) -> Result<(), String> {
 }
 
 fn classify_with_env(diff: &diff::StagedDiff, message: &str) -> Result<Classification, String> {
-    let client = std::env::var("TYPESAFE_API_KEY")
-        .ok()
-        .filter(|k| !k.is_empty())
-        .map(|key| {
-            let base =
-                std::env::var("JEV_CC_BASE_URL").unwrap_or_else(|_| jev::DEFAULT_BASE_URL.into());
-            let timeout = Duration::from_millis(env_f64("JEV_CC_TIMEOUT_MS", 1000.0) as u64);
-            jev::Client::new(key, &base, timeout)
-        });
+    let client = credentials::api_key().map(|key| {
+        let base =
+            std::env::var("JEV_CC_BASE_URL").unwrap_or_else(|_| jev::DEFAULT_BASE_URL.into());
+        let timeout = Duration::from_millis(env_f64("JEV_CC_TIMEOUT_MS", 1000.0) as u64);
+        jev::Client::new(key, &base, timeout)
+    });
     let settings = Settings {
         breaking_threshold: env_f64("JEV_CC_BREAKING_THRESHOLD", 0.85),
     };
     classify::classify(client.as_ref(), diff, message, &settings)
 }
+
+fn login() -> Result<(), String> {
+    let dir = credentials::dir().ok_or("couldn't find a config directory (HOME is not set)")?;
+    let key = read_key()?;
+    if key.is_empty() {
+        return Err("no key entered".into());
+    }
+    let path = credentials::save(&dir, &key)?;
+    println!("saved API key to {}", path.display());
+    if std::env::var_os("TYPESAFE_API_KEY").is_some_and(|v| !v.is_empty()) {
+        eprintln!("note: TYPESAFE_API_KEY is set in this shell and takes precedence");
+    }
+    Ok(())
+}
+
+fn logout() -> Result<(), String> {
+    let dir = credentials::dir().ok_or("couldn't find a config directory (HOME is not set)")?;
+    match credentials::delete(&dir)? {
+        Some(path) => println!("removed {}", path.display()),
+        None => println!("no saved API key"),
+    }
+    Ok(())
+}
+
+/// Reads the key from stdin: hidden when typed or pasted at a terminal, or piped in
+/// (`echo "$KEY" | jev-cc login`).
+fn read_key() -> Result<String, String> {
+    use std::io::{BufRead, IsTerminal};
+    let stdin = std::io::stdin();
+    let interactive = stdin.is_terminal();
+    if interactive {
+        // Echo off before the prompt appears, so fast pastes can't be echoed.
+        set_echo(false);
+        eprint!("Paste your TypeSafe API key: ");
+    }
+    let mut line = String::new();
+    let result = stdin.lock().read_line(&mut line);
+    if interactive {
+        set_echo(true);
+        eprintln!();
+    }
+    result.map_err(|e| e.to_string())?;
+    Ok(line.trim().to_string())
+}
+
+#[cfg(unix)]
+fn set_echo(on: bool) {
+    let _ = Command::new("stty")
+        .arg(if on { "echo" } else { "-echo" })
+        .stdin(Stdio::inherit())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn set_echo(_on: bool) {}
 
 fn install() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
