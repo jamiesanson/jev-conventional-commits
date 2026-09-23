@@ -40,11 +40,11 @@ Prebuilt archives for each platform are also on the
 [releases page](https://github.com/jamiesanson/jev-conventional-commits/releases). To build from
 source, run `cargo install --path .`.
 
-Then, in each repository:
+Then:
 
 ```sh
-export TYPESAFE_API_KEY=...   # from TypeSafe
-jev-cc install
+jev-cc login     # once: paste your TypeSafe API key
+jev-cc install   # in each repository
 ```
 
 With `git commit -m`, the prefix goes in front of your message. With the editor, the first
@@ -66,7 +66,7 @@ fix(config): handle empty config files
 
 | Variable | Default | |
 |---|---|---|
-| `TYPESAFE_API_KEY` | | |
+| `TYPESAFE_API_KEY` | | Overrides the key saved by `jev-cc login` |
 | `JEV_CC_TIMEOUT_MS` | `1000` | |
 | `JEV_CC_MIN_CONFIDENCE` | `0.6` | Minimum confidence to apply a type |
 | `JEV_CC_BREAKING_THRESHOLD` | `0.85` | Probability needed to add `!` |
