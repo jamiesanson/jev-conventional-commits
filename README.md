@@ -71,10 +71,11 @@ $ jev-cc reword --dry-run   # show what would change
 $ jev-cc reword
 ```
 
-This covers unpushed commits (everything after your branch's upstream). Pass a commit to
-start after instead, e.g. `jev-cc reword main`. It runs a `git rebase`, so hashes change
-and signed commits are signed again. If you reword commits you've already pushed, push
-with `git push --force-with-lease`.
+This covers the current branch's commits since it left `main` (or `master`), pushed or
+not; on `main` itself, that's your unpushed commits. It runs a `git rebase`, so hashes
+change and signed commits are signed again. If you reword commits you've already pushed,
+push with `git push --force-with-lease`. For a branch stacked on another, pass
+`--since <parent-branch>`.
 
 ## Configuration
 

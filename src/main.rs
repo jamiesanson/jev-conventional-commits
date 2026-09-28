@@ -24,7 +24,8 @@ USAGE:
     jev-cc install                       Install the git hooks into the current repository
     jev-cc classify [MESSAGE]            Classify the staged diff and print the prefix
     jev-cc config                        Show the settings in effect and where each comes from
-    jev-cc reword [--dry-run] [BASE]     Prefix commits after BASE (default: upstream) that have none
+    jev-cc reword [--dry-run]            Prefix this branch's commits that have none
+        --since REV    Start after REV instead of where the branch left main
     jev-cc eval [OPTIONS] [REV]          Compare jev-cc's choices with the prefixes in REV's history
         --limit N      Commits to evaluate (default: 50)
         --message      Send each commit's description, as `git commit -m` would

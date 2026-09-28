@@ -16,23 +16,32 @@ use crate::{message, parallel};
 /// Where the sequence editor finds the planned prefixes.
 const PLAN_VAR: &str = "JEV_CC_REWORD_PLAN";
 
+/// Where the default branch might be, most preferred first.
+const REMOTE_DEFAULTS: &[&str] = &["origin/HEAD", "origin/main", "origin/master"];
+const LOCAL_DEFAULTS: &[&str] = &["main", "master"];
+
 pub struct Options {
-    /// Commits after this one, up to HEAD, are considered. Defaults to the upstream.
-    pub base: Option<String>,
+    /// Commits after this one, up to HEAD, are considered. Defaults to where the branch
+    /// left the default branch.
+    pub since: Option<String>,
     pub dry_run: bool,
 }
 
 impl Options {
     pub fn parse(args: &[&str]) -> Result<Options, String> {
         let mut options = Options {
-            base: None,
+            since: None,
             dry_run: false,
         };
-        for &arg in args {
+        let mut args = args.iter();
+        while let Some(&arg) = args.next() {
             match arg {
                 "--dry-run" | "-n" => options.dry_run = true,
+                "--since" => {
+                    let rev = args.next().ok_or("--since needs a commit")?;
+                    options.since = Some(rev.to_string());
+                }
                 _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
-                _ if options.base.is_none() => options.base = Some(arg.to_string()),
                 _ => return Err(format!("unexpected argument {arg}")),
             }
         }
@@ -61,12 +70,12 @@ pub fn run<F>(options: &Options, classify: F) -> Result<(), String>
 where
     F: Fn(&str, &str) -> Result<Classification, String> + Sync,
 {
-    let base = match &options.base {
-        Some(base) => resolve(base).ok_or(format!("unknown revision {base}"))?,
-        None => resolve("@{upstream}").ok_or(
-            "this branch has no upstream; pass the commit to start after, \
-             e.g. `jev-cc reword main`",
-        )?,
+    let (base, described) = match &options.since {
+        Some(rev) => (
+            resolve(rev).ok_or(format!("unknown revision {rev}"))?,
+            rev.clone(),
+        ),
+        None => branch_start()?,
     };
     let head = git(&["rev-parse", "HEAD"])?.trim().to_string();
     let candidates: Vec<Commit> = commits_between(&base, &head)?
@@ -74,9 +83,14 @@ where
         .filter(|c| !message::should_skip(c.subject()))
         .collect();
     if candidates.is_empty() {
-        println!("nothing to reword");
+        println!("nothing to reword since {described}");
         return Ok(());
     }
+    let count = match candidates.len() {
+        1 => "1 unprefixed commit".to_string(),
+        n => format!("{n} unprefixed commits"),
+    };
+    println!("{count} since {described} ({}):", &base[..7]);
 
     let results = parallel::map(&candidates, |commit| {
         classify(&commit.sha, commit.message.trim())
@@ -240,6 +254,55 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Where the current branch left the default branch, and that branch's name. Both the
+/// local and remote default branch count, whichever the branch left most recently, so
+/// unpushed commits on local `main` aren't mistaken for the branch's own. On the default
+/// branch itself only the remote counts, so this is the last push.
+fn branch_start() -> Result<(String, String), String> {
+    let remote = REMOTE_DEFAULTS
+        .iter()
+        .find(|b| resolve(b).is_some())
+        .map(|b| git(&["rev-parse", "--abbrev-ref", b]).map(|name| name.trim().to_string()))
+        .transpose()?;
+    let local_name = remote
+        .as_deref()
+        .and_then(|r| r.split_once('/'))
+        .map(|(_, name)| name)
+        .filter(|name| resolve(name).is_some())
+        .or_else(|| {
+            LOCAL_DEFAULTS
+                .iter()
+                .copied()
+                .find(|b| resolve(b).is_some())
+        });
+    let current = git(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map(|b| b.trim().to_string())
+        .ok();
+    let local = local_name
+        .filter(|name| current.as_deref() != Some(*name))
+        .map(str::to_string);
+
+    let mut best: Option<(String, String)> = None;
+    for name in remote.into_iter().chain(local) {
+        let base = git(&["merge-base", "HEAD", &name])?.trim().to_string();
+        let newer = match &best {
+            None => true,
+            Some((current, _)) => is_ancestor(current, &base),
+        };
+        if newer {
+            best = Some((base, name));
+        }
+    }
+    best.ok_or_else(|| {
+        "can't find where this branch started; pass --since with the commit to start after"
+            .to_string()
+    })
+}
+
+fn is_ancestor(ancestor: &str, of: &str) -> bool {
+    git(&["merge-base", "--is-ancestor", ancestor, of]).is_ok()
+}
+
 fn resolve(rev: &str) -> Option<String> {
     git(&[
         "rev-parse",
@@ -303,10 +366,11 @@ mod tests {
 
     #[test]
     fn parses_options() {
-        let o = Options::parse(&["-n", "main"]).unwrap();
+        let o = Options::parse(&["-n", "--since", "v1.0"]).unwrap();
         assert!(o.dry_run);
-        assert_eq!(o.base.as_deref(), Some("main"));
-        assert!(Options::parse(&["a", "b"]).is_err());
+        assert_eq!(o.since.as_deref(), Some("v1.0"));
+        assert!(Options::parse(&["main"]).is_err());
+        assert!(Options::parse(&["--since"]).is_err());
         assert!(Options::parse(&["--force"]).is_err());
     }
 
