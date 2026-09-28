@@ -165,6 +165,14 @@ cargo build --release
 ./target/release/jev-cc install   # dogfood: classify this repo's own commits
 ```
 
+To measure a change to classification, run `jev-cc eval` in a repository whose history
+already uses conventional prefixes. It replays the last 50 labelled commits (`--limit`)
+through the classifier and reports accuracy and the most common mistakes. `--message` also
+sends each commit's description, as `git commit -m` would, and `--out FILE` writes every
+answer with Jev's probabilities as JSON lines. Set `types` in that repository's
+`.jev-cc.toml` to match its conventions first; many projects label dependency and CI
+updates `chore`, which the default types would call `build` and `ci`.
+
 ### Releasing
 
 Releases are built by [dist](https://opensource.axo.dev/cargo-dist/) in

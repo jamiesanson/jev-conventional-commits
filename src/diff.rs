@@ -15,22 +15,32 @@ pub struct ChangedFile {
     pub path: String,
 }
 
-const NAME_STATUS: &[&str] = &["diff", "--cached", "--name-status", "-M", "-z"];
-const PATCH: &[&str] = &[
-    "diff",
-    "--cached",
-    "-M",
-    "--unified=1",
-    "--no-color",
-    "--no-ext-diff",
-];
-
-/// Every staged file. Only used locally.
-pub fn staged_files() -> Result<Vec<ChangedFile>, String> {
-    Ok(parse_name_status(&git(NAME_STATUS, &[])?))
+/// Which changes to read: what's staged, or what an existing commit changed (used by
+/// `jev-cc eval` to replay history).
+#[derive(Debug, Clone, Copy)]
+pub enum Changes<'a> {
+    Staged,
+    Commit(&'a str),
 }
 
-/// What's sent to Jev: the staged files not matched by an `exclude` pattern, and their
+impl Changes<'_> {
+    fn args(self) -> Vec<String> {
+        match self {
+            Changes::Staged => vec!["diff".into(), "--cached".into()],
+            Changes::Commit(sha) => vec!["diff".into(), format!("{sha}^!")],
+        }
+    }
+}
+
+const NAME_STATUS: &[&str] = &["--name-status", "-M", "-z"];
+const PATCH: &[&str] = &["-M", "--unified=1", "--no-color", "--no-ext-diff"];
+
+/// Every changed file. Only used locally.
+pub fn changed_files(changes: Changes) -> Result<Vec<ChangedFile>, String> {
+    Ok(parse_name_status(&git(changes, NAME_STATUS, &[])?))
+}
+
+/// What's sent to Jev: the changed files not matched by an `exclude` pattern, and their
 /// patch. Only built once the local rules can't decide, so they stay fast.
 #[derive(Debug)]
 pub struct Outgoing {
@@ -40,18 +50,22 @@ pub struct Outgoing {
 
 /// `exclude` holds git glob pathspecs relative to the repository root. Git applies them,
 /// so excluded files' paths and contents never reach the patch.
-pub fn outgoing(all: &[ChangedFile], exclude: &[String]) -> Result<Outgoing, String> {
+pub fn outgoing(
+    changes: Changes,
+    all: &[ChangedFile],
+    exclude: &[String],
+) -> Result<Outgoing, String> {
     let pathspecs = exclude_pathspecs(exclude);
     if pathspecs.is_empty() {
         return Ok(Outgoing {
             files: all.to_vec(),
-            patch: trim_patch(&git(PATCH, &[])?),
+            patch: trim_patch(&git(changes, PATCH, &[])?),
         });
     }
     // Both git runs are needed; run them side by side.
     let (files, patch) = std::thread::scope(|s| {
-        let files = s.spawn(|| git(NAME_STATUS, &pathspecs));
-        let patch = git(PATCH, &pathspecs);
+        let files = s.spawn(|| git(changes, NAME_STATUS, &pathspecs));
+        let patch = git(changes, PATCH, &pathspecs);
         (files.join().expect("git thread panicked"), patch)
     });
     Ok(Outgoing {
@@ -71,9 +85,9 @@ fn exclude_pathspecs(exclude: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn git(args: &[&str], pathspecs: &[String]) -> Result<String, String> {
+fn git(changes: Changes, args: &[&str], pathspecs: &[String]) -> Result<String, String> {
     let mut command = Command::new("git");
-    command.args(args);
+    command.args(changes.args()).args(args);
     if !pathspecs.is_empty() {
         command.arg("--").args(pathspecs);
     }
