@@ -62,6 +62,19 @@ fix(config): handle empty config files
   source: Jev, confidence: 87%, took 180ms
 ```
 
+### Prefixing commits later
+
+Commits made offline are left unprefixed. Once you're back online, prefix them in one go:
+
+```console
+$ jev-cc reword --dry-run   # show what would change
+$ jev-cc reword
+```
+
+This covers unpushed commits (everything after your branch's upstream). Pass a commit to
+start after instead, e.g. `jev-cc reword main`. Commits are rewritten like a rebase, so
+their hashes change, and commits already on a remote are refused.
+
 ## Configuration
 
 Settings are read from these places, each overriding the one before:

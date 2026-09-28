@@ -5,6 +5,8 @@ mod diff;
 mod eval;
 mod jev;
 mod message;
+mod parallel;
+mod reword;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -22,6 +24,7 @@ USAGE:
     jev-cc install                       Install the git hooks into the current repository
     jev-cc classify [MESSAGE]            Classify the staged diff and print the prefix
     jev-cc config                        Show the settings in effect and where each comes from
+    jev-cc reword [--dry-run] [BASE]     Prefix commits after BASE (default: upstream) that have none
     jev-cc eval [OPTIONS] [REV]          Compare jev-cc's choices with the prefixes in REV's history
         --limit N      Commits to evaluate (default: 50)
         --message      Send each commit's description, as `git commit -m` would
@@ -73,6 +76,7 @@ fn main() -> ExitCode {
         ["classify", message @ ..] => command_result(run_classify(&message.join(" "))),
         ["config"] => command_result(show_config()),
         ["eval", rest @ ..] => command_result(run_eval(rest)),
+        ["reword", rest @ ..] => command_result(run_reword(rest)),
         ["install"] => command_result(install()),
         ["login"] => command_result(login()),
         ["logout"] => command_result(logout()),
@@ -148,7 +152,8 @@ fn start_deadline(message_file: &Path, deadline_ms: u64) {
         std::thread::sleep(deadline);
         let _ = std::fs::remove_file(&tmp);
         eprintln!(
-            "jev-cc: message left unchanged (took longer than {}ms)",
+            "jev-cc: message left unchanged (took longer than {}ms; run `jev-cc reword` later \
+             to prefix it)",
             deadline.as_millis()
         );
         std::process::exit(0);
@@ -175,16 +180,15 @@ fn prepare_commit_msg(file: &Path, source: Option<&str>, config: &Config) -> Res
     if files.is_empty() {
         return Ok(());
     }
-    let classification = classify_changes(diff::Changes::Staged, &files, &body, config, None)?;
-    let min_confidence = config.min_confidence.value;
-    if classification.confidence < min_confidence {
-        return Err(format!(
-            "best guess {} at {:.0}% confidence, below {:.0}%",
-            classification.kind,
-            classification.confidence * 100.0,
-            min_confidence * 100.0
-        ));
-    }
+    let classification = classify_changes(diff::Changes::Staged, &files, &body, config, None)
+        .map_err(|e| {
+            if e.starts_with(jev::REQUEST_FAILED) {
+                format!("{e}; run `jev-cc reword` later to prefix it")
+            } else {
+                e
+            }
+        })?;
+    let classification = confident(classification, config)?;
 
     write_atomic(
         file,
@@ -249,6 +253,33 @@ fn run_eval(args: &[&str]) -> Result<(), String> {
         let files = diff::changed_files(changes)?;
         classify_changes(changes, &files, message, &config, timeout)
     })
+}
+
+fn run_reword(args: &[&str]) -> Result<(), String> {
+    let options = reword::Options::parse(args)?;
+    let config = command_config();
+    // Not on the commit path, so a slow network can have longer.
+    let timeout = Some(Duration::from_secs(10));
+    reword::run(&options, |sha, message| {
+        let changes = diff::Changes::Commit(sha);
+        let files = diff::changed_files(changes)?;
+        let c = classify_changes(changes, &files, message, &config, timeout)?;
+        confident(c, &config)
+    })
+}
+
+/// Rejects answers below `min_confidence`, so the message is left as the user wrote it.
+fn confident(c: Classification, config: &Config) -> Result<Classification, String> {
+    let min_confidence = config.min_confidence.value;
+    if c.confidence < min_confidence {
+        return Err(format!(
+            "best guess {} at {:.0}% confidence, below {:.0}%",
+            c.kind,
+            c.confidence * 100.0,
+            min_confidence * 100.0
+        ));
+    }
+    Ok(c)
 }
 
 /// `timeout` overrides the configured request timeout.

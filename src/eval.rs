@@ -5,14 +5,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::classify::{Classification, Source};
-use crate::message;
-
-/// Requests in flight at once.
-const WORKERS: usize = 8;
+use crate::{message, parallel};
 
 pub struct Options {
     pub limit: usize,
@@ -75,29 +70,14 @@ where
     }
     eprintln!("jev-cc: evaluating {} commits", commits.len());
 
-    let results: Vec<Mutex<Option<Result<Classification, String>>>> =
-        commits.iter().map(|_| Mutex::new(None)).collect();
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        for _ in 0..WORKERS.min(commits.len()) {
-            s.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(commit) = commits.get(i) else { break };
-                    let message = if options.with_message {
-                        commit.label().description
-                    } else {
-                        ""
-                    };
-                    *results[i].lock().unwrap() = Some(classify(&commit.sha, message));
-                }
-            });
-        }
+    let results = parallel::map(&commits, |commit| {
+        let message = if options.with_message {
+            commit.label().description
+        } else {
+            ""
+        };
+        classify(&commit.sha, message)
     });
-    let results: Vec<Result<Classification, String>> = results
-        .into_iter()
-        .map(|r| r.into_inner().unwrap().expect("every commit is classified"))
-        .collect();
 
     if let Some(path) = &options.out {
         write_jsonl(path, &commits, &results)?;

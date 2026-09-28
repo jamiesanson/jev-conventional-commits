@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 pub const DEFAULT_MODEL: &str = "jev-latest";
+/// Starts the message of a request that never got a response, such as when offline.
+pub const REQUEST_FAILED: &str = "request failed";
 
 #[derive(Debug, Serialize)]
 pub struct Request<'a> {
@@ -74,7 +76,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::MissingApiKey => write!(f, "no API key; run `jev-cc login`"),
-            Error::Http(e) => write!(f, "request failed: {e}"),
+            Error::Http(e) => write!(f, "{REQUEST_FAILED}: {e}"),
             Error::Status(code, body) => write!(f, "API returned {code}: {body}"),
         }
     }
