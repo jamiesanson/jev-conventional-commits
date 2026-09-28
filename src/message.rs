@@ -17,22 +17,42 @@ pub fn body(content: &str) -> String {
         .to_string()
 }
 
-/// Whether `subject` already starts with `type(scope)!: `.
-pub fn is_conventional(subject: &str) -> bool {
-    let Some((head, _)) = subject.split_once(": ") else {
-        return false;
+/// The parts of a `type(scope)!: description` subject.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Prefix<'a> {
+    pub kind: &'a str,
+    pub scope: Option<&'a str>,
+    pub breaking: bool,
+    pub description: &'a str,
+}
+
+pub fn parse_prefix(subject: &str) -> Option<Prefix<'_>> {
+    let (head, description) = subject.split_once(": ")?;
+    let (head, breaking) = match head.strip_suffix('!') {
+        Some(head) => (head, true),
+        None => (head, false),
     };
-    let head = head.strip_suffix('!').unwrap_or(head);
     let (kind, scope) = match head.split_once('(') {
         Some((kind, rest)) => match rest.strip_suffix(')') {
             Some(scope) if !scope.is_empty() && !scope.contains(['(', ')']) => (kind, Some(scope)),
-            _ => return false,
+            _ => return None,
         },
         None => (head, None),
     };
-    !kind.is_empty()
+    let valid = !kind.is_empty()
         && kind.chars().all(|c| c.is_ascii_lowercase())
-        && scope.is_none_or(|s| !s.contains(' '))
+        && scope.is_none_or(|s| !s.contains(' '));
+    valid.then_some(Prefix {
+        kind,
+        scope,
+        breaking,
+        description,
+    })
+}
+
+/// Whether `subject` already starts with `type(scope)!: `.
+pub fn is_conventional(subject: &str) -> bool {
+    parse_prefix(subject).is_some()
 }
 
 pub fn should_skip(subject: &str) -> bool {
@@ -67,6 +87,21 @@ pub fn is_bare_prefix(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_prefix_parts() {
+        assert_eq!(
+            parse_prefix("feat(api)!: drop v1"),
+            Some(Prefix {
+                kind: "feat",
+                scope: Some("api"),
+                breaking: true,
+                description: "drop v1",
+            })
+        );
+        assert_eq!(parse_prefix("fix: typo").map(|p| p.scope), Some(None));
+        assert_eq!(parse_prefix("Update README"), None);
+    }
 
     #[test]
     fn detects_conventional_subjects() {

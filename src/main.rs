@@ -2,6 +2,7 @@ mod classify;
 mod config;
 mod credentials;
 mod diff;
+mod eval;
 mod jev;
 mod message;
 
@@ -21,6 +22,10 @@ USAGE:
     jev-cc install                       Install the git hooks into the current repository
     jev-cc classify [MESSAGE]            Classify the staged diff and print the prefix
     jev-cc config                        Show the settings in effect and where each comes from
+    jev-cc eval [OPTIONS] [REV]          Compare jev-cc's choices with the prefixes in REV's history
+        --limit N      Commits to evaluate (default: 50)
+        --message      Send each commit's description, as `git commit -m` would
+        --out FILE     Also write each result as a JSON line
     jev-cc prepare-commit-msg FILE [SOURCE] [SHA]   (git hook)
     jev-cc commit-msg FILE                          (git hook)
 
@@ -67,6 +72,7 @@ fn main() -> ExitCode {
         }
         ["classify", message @ ..] => command_result(run_classify(&message.join(" "))),
         ["config"] => command_result(show_config()),
+        ["eval", rest @ ..] => command_result(run_eval(rest)),
         ["install"] => command_result(install()),
         ["login"] => command_result(login()),
         ["logout"] => command_result(logout()),
@@ -165,11 +171,11 @@ fn prepare_commit_msg(file: &Path, source: Option<&str>, config: &Config) -> Res
         return Ok(());
     }
 
-    let files = diff::staged_files()?;
+    let files = diff::changed_files(diff::Changes::Staged)?;
     if files.is_empty() {
         return Ok(());
     }
-    let classification = classify_staged(&files, &body, config)?;
+    let classification = classify_changes(diff::Changes::Staged, &files, &body, config, None)?;
     let min_confidence = config.min_confidence.value;
     if classification.confidence < min_confidence {
         return Err(format!(
@@ -217,11 +223,11 @@ fn tmp_path(path: &Path) -> PathBuf {
 fn run_classify(message: &str) -> Result<(), String> {
     let started = Instant::now();
     let config = command_config();
-    let files = diff::staged_files()?;
+    let files = diff::changed_files(diff::Changes::Staged)?;
     if files.is_empty() {
         return Err("nothing staged".into());
     }
-    let c = classify_staged(&files, message, &config)?;
+    let c = classify_changes(diff::Changes::Staged, &files, message, &config, None)?;
     println!("{}{message}", c.prefix());
     eprintln!(
         "  source: {:?}, confidence: {:.0}%, took {}ms",
@@ -232,13 +238,29 @@ fn run_classify(message: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn classify_staged(
+fn run_eval(args: &[&str]) -> Result<(), String> {
+    let options = eval::Options::parse(args)?;
+    let config = command_config();
+    let types: Vec<String> = config.types.value.iter().map(|t| t.name.clone()).collect();
+    // Hook timeouts are tuned for commit latency; replaying history can wait longer.
+    let timeout = Some(Duration::from_secs(20));
+    eval::run(&options, &types, |sha, message| {
+        let changes = diff::Changes::Commit(sha);
+        let files = diff::changed_files(changes)?;
+        classify_changes(changes, &files, message, &config, timeout)
+    })
+}
+
+/// `timeout` overrides the configured request timeout.
+fn classify_changes(
+    changes: diff::Changes,
     files: &[diff::ChangedFile],
     message: &str,
     config: &Config,
+    timeout: Option<Duration>,
 ) -> Result<Classification, String> {
     let client = credentials::api_key().map(|key| {
-        let timeout = Duration::from_millis(config.timeout_ms.value);
+        let timeout = timeout.unwrap_or(Duration::from_millis(config.timeout_ms.value));
         jev::Client::new(key, &config.base_url.value, timeout)
     });
     let settings = Settings {
@@ -247,7 +269,14 @@ fn classify_staged(
         scopes: &config.scopes,
     };
     let exclude: Vec<String> = config.exclude.iter().map(|s| s.value.clone()).collect();
-    classify::classify(client.as_ref(), files, &exclude, message, &settings)
+    classify::classify(
+        client.as_ref(),
+        changes,
+        files,
+        &exclude,
+        message,
+        &settings,
+    )
 }
 
 fn show_config() -> Result<(), String> {

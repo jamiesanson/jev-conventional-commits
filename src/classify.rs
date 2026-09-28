@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::config::{ScopeRule, TypeDef};
-use crate::diff::{self, ChangedFile, Outgoing};
+use crate::diff::{self, ChangedFile, Changes, Outgoing};
 use crate::jev::{self, Answer, NoulCriteria, Question};
 
 const TYPE_INSTRUCTIONS: &str =
@@ -26,6 +26,10 @@ pub struct Classification {
     pub scope: Option<String>,
     pub breaking: bool,
     pub confidence: f64,
+    /// Jev's probability for every allowed type. Empty for local answers.
+    pub probabilities: BTreeMap<String, f64>,
+    /// Jev's probability that the change is breaking. `None` for local answers.
+    pub breaking_probability: Option<f64>,
     pub source: Source,
 }
 
@@ -53,6 +57,7 @@ pub struct Settings<'a> {
 
 pub fn classify(
     client: Option<&jev::Client>,
+    changes: Changes,
     files: &[ChangedFile],
     exclude: &[String],
     message: &str,
@@ -66,38 +71,47 @@ pub fn classify(
             scope,
             breaking: false,
             confidence: 1.0,
+            probabilities: BTreeMap::new(),
+            breaking_probability: None,
             source: Source::Local,
         });
     }
 
     let client = client.ok_or_else(|| jev::Error::MissingApiKey.to_string())?;
-    let outgoing = diff::outgoing(files, exclude)?;
+    let outgoing = diff::outgoing(changes, files, exclude)?;
     if outgoing.files.is_empty() {
         return Err("every changed file is excluded".into());
     }
-    let response = client
+    let mut response = client
         .system_one(&request(&outgoing, message, settings.types))
         .map_err(|e| e.to_string())?;
 
-    let (kind, confidence) = match response.answers.get("type") {
-        Some(Answer::Choice { choice, confidence }) => settings
-            .types
-            .iter()
-            .find(|t| &t.name == choice)
-            .map(|t| (t.name.clone(), *confidence))
-            .ok_or_else(|| format!("unexpected type from Jev: {choice}"))?,
+    let (kind, confidence, probabilities) = match response.answers.remove("type") {
+        Some(Answer::Choice {
+            choice,
+            confidence,
+            probabilities,
+        }) => {
+            if !settings.types.iter().any(|t| t.name == choice) {
+                return Err(format!("unexpected type from Jev: {choice}"));
+            }
+            (choice, confidence, probabilities)
+        }
         _ => return Err("response had no type answer".into()),
     };
-    let breaking = matches!(
-        response.answers.get("breaking"),
-        Some(Answer::Noul { noul }) if *noul >= settings.breaking_threshold
-    );
+    let breaking_probability = match response.answers.get("breaking") {
+        Some(Answer::Noul { noul }) => Some(*noul),
+        _ => None,
+    };
+    let breaking = breaking_probability.is_some_and(|p| p >= settings.breaking_threshold);
 
     Ok(Classification {
         kind,
         scope,
         breaking,
         confidence,
+        probabilities,
+        breaking_probability,
         source: Source::Jev,
     })
 }
@@ -383,6 +397,8 @@ mod tests {
             scope: Some("api".into()),
             breaking: true,
             confidence: 0.9,
+            probabilities: BTreeMap::new(),
+            breaking_probability: None,
             source: Source::Jev,
         };
         assert_eq!(c.prefix(), "feat(api)!: ");

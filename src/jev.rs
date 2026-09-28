@@ -55,6 +55,8 @@ pub enum Answer {
     Choice {
         choice: String,
         confidence: f64,
+        #[serde(default)]
+        probabilities: BTreeMap<String, f64>,
     },
     /// Question types this tool doesn't ask, kept so parsing never fails on them.
     #[serde(other)]
