@@ -72,8 +72,9 @@ $ jev-cc reword
 ```
 
 This covers unpushed commits (everything after your branch's upstream). Pass a commit to
-start after instead, e.g. `jev-cc reword main`. Commits are rewritten like a rebase, so
-their hashes change, and commits already on a remote are refused.
+start after instead, e.g. `jev-cc reword main`. It runs a `git rebase`, so hashes change
+and signed commits are signed again. If you reword commits you've already pushed, push
+with `git push --force-with-lease`.
 
 ## Configuration
 

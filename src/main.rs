@@ -77,6 +77,9 @@ fn main() -> ExitCode {
         ["config"] => command_result(show_config()),
         ["eval", rest @ ..] => command_result(run_eval(rest)),
         ["reword", rest @ ..] => command_result(run_reword(rest)),
+        // Internal: run by the rebase `jev-cc reword` starts.
+        ["__reword-todo", todo] => command_result(reword::edit_todo(Path::new(todo))),
+        ["__reword-amend", prefix] => command_result(reword::amend(prefix)),
         ["install"] => command_result(install()),
         ["login"] => command_result(login()),
         ["logout"] => command_result(logout()),
